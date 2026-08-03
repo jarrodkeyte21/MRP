@@ -921,6 +921,11 @@
     document.getElementById('whoAmI').textContent = currentSession
       ? `${currentSession.user.email}${role ? ' (' + role + ')' : ''}`
       : '';
+    // Sign-off is a supervisor confirming hours actually happened — floor staff can flag their own day as
+    // finished (that button lives on their Job Card itself), but shouldn't be able to also rubber-stamp the
+    // sign-off step for themselves. The FAB is the only way into that page (it's outside .pagenav), so hiding it
+    // removes the only path there.
+    document.getElementById('signoffFab').style.display = isManager ? '' : 'none';
     if (role === 'floor'){
       // Only the "Job Cards" nav stays visible/reachable — everything else, including direct showPage() calls
       // from any leftover UI state, is simply never shown since only this one page's button remains.
