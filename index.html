@@ -337,6 +337,7 @@
     <input type="file" id="fileImport" accept="application/json" style="display:none">
     <button class="ghost" id="btnExportCsv">Export schedule CSV</button>
     <button class="ghost" id="btnClearSignoff">Clear sign-off history</button>
+    <span id="syncStatus" class="hint" style="align-self:center"></span>
   </div>
 </header>
 
@@ -433,8 +434,9 @@
   <section class="row-gap" id="signoffPageSection"></section>
 </div>
 
-<footer class="note">All data is kept in this browser only (localStorage) — nothing is sent anywhere. Use Export config to back up or share a setup.</footer>
+<footer class="note">Data syncs live to a shared Supabase project when online, and falls back to this browser's local storage when it can't reach it. Use Export config to back up or share a setup.</footer>
 
+<script src="https://unpkg.com/@supabase/supabase-js@2"></script>
 <script>
 (function(){
   const DOW_ORDER = [1,2,3,4,5,6,0]; // Mon..Sun
@@ -770,7 +772,90 @@
     } catch(e) {}
     return sampleState();
   }
-  function save(){ localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
+  function save(){ localStorage.setItem(STORE_KEY, JSON.stringify(state)); scheduleRemotePush(); }
+
+  // ---------- live sync (Supabase) ----------
+  // Everyone using the deployed link shares one row: the whole app state as a single JSON blob. localStorage
+  // stays the source of truth for instant, offline-safe reads/writes (save() above still always writes there
+  // first) — this layer just keeps that local copy and the shared remote copy converging, last-write-wins.
+  // Falls back to local-only silently if the SDK didn't load or the keys aren't set.
+  const SUPABASE_URL = 'https://uoybimuwcgznwlbzachl.supabase.co';
+  const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVveWJpbXV3Y2d6bndsYnphY2hsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU3ODI5NjEsImV4cCI6MjEwMTM1ODk2MX0.n5WvPdxwjZd9Tddcg0wgTwcKwRi-J6Y3PkWzvtWvbeY';
+  const SUPABASE_STATE_ID = 'main';
+  const sb = (window.supabase && SUPABASE_URL && SUPABASE_ANON_KEY)
+    ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+    : null;
+
+  let lastSyncedUpdatedAt = null; // remote updated_at as of the last successful pull/push
+  let lastSyncedSnapshot = null;  // JSON.stringify(state) as of the last successful pull/push — skips redundant pushes
+  let pushTimer = null;
+  // Blocks any push until the very first pull attempt (at the bottom of this file) has finished — otherwise the
+  // save() calls that happen while state is still loading/normalizing on startup could push stale/sample local
+  // data up and stomp on whatever's already shared, before we've even checked what's there.
+  let syncReady = false;
+
+  function setSyncStatus(status){
+    const el = document.getElementById('syncStatus');
+    if (!el) return;
+    const labels = { offline: '⚪ Local only (no live sync)', syncing: '🔄 Syncing…', synced: '🟢 Synced', error: '🔴 Sync error — check connection' };
+    el.textContent = labels[status] || '';
+  }
+  if (!sb) setSyncStatus('offline');
+
+  // Real user edits call save() constantly (every checkbox, every keystroke's blur, etc.) — debounce so a burst
+  // of edits becomes one push, not dozens.
+  function scheduleRemotePush(){
+    if (!sb || !syncReady) return;
+    clearTimeout(pushTimer);
+    pushTimer = setTimeout(pushRemoteState, 900);
+  }
+
+  async function pushRemoteState(){
+    if (!sb) return;
+    const snapshot = JSON.stringify(state);
+    if (snapshot === lastSyncedSnapshot) return; // nothing's actually changed since we last synced either way
+    try {
+      setSyncStatus('syncing');
+      const nowIso = new Date().toISOString();
+      const { error } = await sb.from('app_state').upsert({ id: SUPABASE_STATE_ID, data: state, updated_at: nowIso });
+      if (error) throw error;
+      lastSyncedSnapshot = snapshot;
+      lastSyncedUpdatedAt = nowIso;
+      setSyncStatus('synced');
+    } catch (err) {
+      setSyncStatus('error');
+    }
+  }
+
+  // Pulls the shared row if it's newer than whatever we last synced — used on load and every auto-refresh
+  // cycle, which is how another person's changes show up here without a manual reload. Writes straight to
+  // localStorage (bypassing save()) so it doesn't turn around and immediately re-push what it just pulled.
+  async function pullRemoteStateIfNewer(){
+    if (!sb) return false;
+    try {
+      const { data: rows, error } = await sb.from('app_state').select('data, updated_at').eq('id', SUPABASE_STATE_ID).limit(1);
+      if (error) throw error;
+      const row = rows && rows[0];
+      if (!row){
+        await pushRemoteState(); // nothing shared yet — seed it with whatever's local
+        return false;
+      }
+      if (!lastSyncedUpdatedAt || row.updated_at > lastSyncedUpdatedAt){
+        state = row.data;
+        normalizeState();
+        localStorage.setItem(STORE_KEY, JSON.stringify(state));
+        lastSyncedUpdatedAt = row.updated_at;
+        lastSyncedSnapshot = JSON.stringify(state);
+        setSyncStatus('synced');
+        return true;
+      }
+      setSyncStatus('synced');
+      return false;
+    } catch (err) {
+      setSyncStatus('error');
+      return false;
+    }
+  }
 
   function migrateMaxHoursToPeople(oldVal){
     const n = Number(oldVal);
@@ -5580,14 +5665,30 @@
   // typing/selecting or has a context menu open, so it never yanks focus or an in-progress edit away. Every
   // render function fully rebuilds its container from scratch, so swapping in the freshly-loaded state is safe:
   // no stale event handlers are left pointing at detached objects. ----------
-  function autoRefreshVisiblePage(){
+  async function autoRefreshVisiblePage(){
     if (document.hidden) return;
     const active = document.activeElement;
     const isEditing = active && ['INPUT', 'SELECT', 'TEXTAREA'].includes(active.tagName);
     if (isEditing || document.querySelector('.ctx-menu')) return;
-    state = load();
-    normalizeState();
-    save();
+    if (localStorage.getItem(STORE_KEY) === null){
+      // Local storage vanished out from under this tab (cleared externally, etc.) — don't let load()'s
+      // sample-data fallback silently reset a live session to blank. Force the pull below to treat the shared
+      // copy as unseen so it re-adopts it unconditionally, instead of comparing against a stale "already synced"
+      // timestamp and concluding (wrongly) that there's nothing new to fetch.
+      lastSyncedUpdatedAt = null;
+      await pullRemoteStateIfNewer();
+    } else {
+      await pullRemoteStateIfNewer(); // picks up other people's changes — writes to localStorage if there's anything newer
+      state = load();
+      normalizeState();
+      // Deliberately NOT save() here — this cycle's only job is picking up same-device-other-tab edits (via
+      // shared localStorage) and persisting normalizeState()'s own fixups back locally. It must never trigger a
+      // remote push: if local storage were ever cleared or reset while this tab stayed open (e.g. by a browser
+      // "clear site data" action, or simply a stale/never-synced tab), this defensive resync would otherwise
+      // happily push that emptiness up and stomp on everyone else's real shared data. Real edits already push
+      // via their own save() call at the point they happen — this loop doesn't need to push on their behalf.
+      localStorage.setItem(STORE_KEY, JSON.stringify(state));
+    }
     if (document.getElementById('page-schedule').style.display !== 'none'){
       renderBuildTable(); renderResults();
     } else if (document.getElementById('page-setup').style.display !== 'none'){
@@ -5614,5 +5715,14 @@
   setInterval(autoRefreshVisiblePage, 5000);
 
   renderAll();
+
+  // Local data renders immediately above (instant, offline-safe) — then check the shared copy right away rather
+  // than waiting for the first 5-second auto-refresh tick, so opening the app on a second device picks up
+  // whatever's already shared as fast as possible.
+  (async () => {
+    const pulled = await pullRemoteStateIfNewer();
+    if (pulled) renderAll();
+    syncReady = true; // now safe to let save() start pushing local edits back up
+  })();
 })();
 </script>
