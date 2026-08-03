@@ -322,8 +322,30 @@
   .signoff-row-main { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; cursor: pointer; }
   .signoff-row-main:hover { background: var(--surface-2); }
   .signoff-row-detail { padding: 8px 10px 10px; border-top: 1px solid var(--line); background: var(--bg); font-size: 12.5px; cursor: default; }
+  #authGate { min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  #authGate .panel { width: 100%; max-width: 360px; }
+  #authGate .field-row { flex-direction: column; align-items: stretch; gap: 4px; }
+  #authGate .field-row input { width: 100%; }
 </style>
 
+<div id="authGate" style="display:none">
+  <div class="panel">
+    <h2>Floor Schedule — Sign in</h2>
+    <div class="hint" id="authHint">Ask your manager for a login if you don't have one yet.</div>
+    <div class="field-row" style="margin-top:10px">
+      <label>Email</label>
+      <input type="email" id="authEmail" autocomplete="username">
+    </div>
+    <div class="field-row" style="margin-top:6px">
+      <label>Password</label>
+      <input type="password" id="authPassword" autocomplete="current-password">
+    </div>
+    <div id="authError" class="hint" style="color:#c0392b; margin-top:6px; display:none"></div>
+    <button class="primary" id="btnSignIn" style="margin-top:10px; width:100%">Sign in</button>
+  </div>
+</div>
+
+<div id="appShell" style="display:none">
 <header class="top">
   <div>
     <div class="eyebrow">Southern Spreaders — Production</div>
@@ -338,6 +360,8 @@
     <button class="ghost" id="btnExportCsv">Export schedule CSV</button>
     <button class="ghost" id="btnClearSignoff">Clear sign-off history</button>
     <span id="syncStatus" class="hint" style="align-self:center"></span>
+    <span id="whoAmI" class="hint" style="align-self:center"></span>
+    <button class="ghost" id="btnSignOut">Sign out</button>
   </div>
 </header>
 
@@ -353,6 +377,7 @@
   <button data-page="jobcardslive" id="navJobCardsLive">Job Cards</button>
   <button data-page="archive" id="navArchive">Archive</button>
   <button data-page="reports" id="navReports">Reports</button>
+  <button data-page="logins" id="navLogins" style="display:none">Logins</button>
 </nav>
 
 <div id="page-schedule">
@@ -434,7 +459,12 @@
   <section class="row-gap" id="signoffPageSection"></section>
 </div>
 
+<div id="page-logins" style="display:none">
+  <section class="row-gap" id="loginsSection"></section>
+</div>
+
 <footer class="note">Data syncs live to a shared Supabase project when online, and falls back to this browser's local storage when it can't reach it. Use Export config to back up or share a setup.</footer>
+</div>
 
 <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
 <script>
@@ -855,6 +885,200 @@
       setSyncStatus('error');
       return false;
     }
+  }
+
+  // ---------- login & roles ----------
+  // Two roles: 'manager' (full app, same as before) and 'floor' (only ever sees their own Job Card, no page
+  // nav). This is a UI-level restriction, not a database-level one — floor accounts are logged in and can read
+  // the same shared app_state blob the manager can (it's all one JSON row, so Postgres row-level security can't
+  // carve out "just this person's data" from inside it). Someone floor-level with dev tools open could still see
+  // the full blob's contents. Good enough for a small trusted team; a real per-person data split would mean
+  // moving off the single-blob model into normalized tables.
+  let currentSession = null;
+  let currentProfile = null; // { id, email, role, person_id } — null until loaded, or if no row exists yet
+
+  async function loadProfile(userId){
+    if (!sb) { currentProfile = null; return; }
+    try {
+      const { data, error } = await sb.from('profiles').select('*').eq('id', userId).maybeSingle();
+      if (error) throw error;
+      currentProfile = data || null;
+    } catch (err) {
+      currentProfile = null;
+    }
+  }
+
+  function showAuthGate(message){
+    document.getElementById('appShell').style.display = 'none';
+    document.getElementById('authGate').style.display = '';
+    document.getElementById('authHint').textContent = message || 'Ask your manager for a login if you don\'t have one yet.';
+  }
+
+  function applyRoleUI(){
+    const role = currentProfile ? currentProfile.role : null;
+    const isManager = role === 'manager';
+    document.getElementById('navLogins').style.display = isManager ? '' : 'none';
+    document.getElementById('whoAmI').textContent = currentSession
+      ? `${currentSession.user.email}${role ? ' (' + role + ')' : ''}`
+      : '';
+    if (role === 'floor'){
+      // Only the "Job Cards" nav stays visible/reachable — everything else, including direct showPage() calls
+      // from any leftover UI state, is simply never shown since only this one page's button remains.
+      Array.from(document.querySelectorAll('.pagenav button')).forEach(b => {
+        b.style.display = (b.id === 'navJobCardsLive') ? '' : 'none';
+      });
+      showPage('jobcardslive');
+    } else {
+      Array.from(document.querySelectorAll('.pagenav button')).forEach(b => { b.style.display = ''; });
+      if (!isManager) showPage('jobcardslive'); // no profile row yet — safest default, nothing destructive reachable
+      else showPage('schedule');
+    }
+  }
+
+  async function onSignedIn(session){
+    currentSession = session;
+    await loadProfile(session.user.id);
+    document.getElementById('authGate').style.display = 'none';
+    document.getElementById('appShell').style.display = '';
+    applyRoleUI();
+    renderAll();
+    setInterval(autoRefreshVisiblePage, 5000);
+    const pulled = await pullRemoteStateIfNewer();
+    if (pulled) { applyRoleUI(); renderAll(); }
+    syncReady = true;
+  }
+
+  async function boot(){
+    if (!sb){ document.getElementById('appShell').style.display = ''; renderAll(); setInterval(autoRefreshVisiblePage, 5000); return; } // no Supabase configured — behave like before, local-only, no login required
+    const { data: { session } } = await sb.auth.getSession();
+    if (!session){ showAuthGate(); return; }
+    await onSignedIn(session);
+  }
+
+  document.getElementById('btnSignIn').addEventListener('click', async () => {
+    if (!sb) return;
+    const email = document.getElementById('authEmail').value.trim();
+    const password = document.getElementById('authPassword').value;
+    const errEl = document.getElementById('authError');
+    errEl.style.display = 'none';
+    if (!email || !password){ errEl.textContent = 'Enter both email and password.'; errEl.style.display = ''; return; }
+    const btn = document.getElementById('btnSignIn');
+    btn.disabled = true; btn.textContent = 'Signing in…';
+    const { data, error } = await sb.auth.signInWithPassword({ email, password });
+    btn.disabled = false; btn.textContent = 'Sign in';
+    if (error){ errEl.textContent = error.message; errEl.style.display = ''; return; }
+    await onSignedIn(data.session);
+  });
+  document.getElementById('authPassword').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') document.getElementById('btnSignIn').click();
+  });
+
+  document.getElementById('btnSignOut').addEventListener('click', async () => {
+    if (sb) await sb.auth.signOut();
+    location.reload(); // simplest clean reset of every in-memory timer/flag, not just auth state
+  });
+
+  // Manager-only: create and review logins. Each login is a real Supabase Auth account (created via a
+  // throwaway, non-persisting client so it doesn't hijack the manager's own session) plus a `profiles` row
+  // linking it to a role and, for floor staff, which person in the app they are.
+  async function renderLoginsPage(){
+    const container = document.getElementById('loginsSection');
+    container.innerHTML = '';
+    const panel = document.createElement('div'); panel.className = 'panel';
+    panel.innerHTML = '<h2>Logins</h2><div class="hint">Manager-only. Floor staff only ever see their own Job Card once linked to a person below.</div>';
+    container.appendChild(panel);
+
+    const listWrap = document.createElement('div'); listWrap.style.marginTop = '10px';
+    listWrap.textContent = 'Loading…';
+    panel.appendChild(listWrap);
+
+    const { data: profiles, error } = sb ? await sb.from('profiles').select('*').order('created_at') : { data: [], error: null };
+    listWrap.innerHTML = '';
+    if (error){
+      listWrap.textContent = 'Could not load logins: ' + error.message;
+    } else if (!profiles || !profiles.length){
+      const empty = document.createElement('div'); empty.className = 'dep-empty';
+      empty.textContent = 'No logins yet — add one below.';
+      listWrap.appendChild(empty);
+    } else {
+      profiles.forEach(p => {
+        const row = document.createElement('div'); row.className = 'drill-row'; row.style.cursor = 'default';
+        const person = p.person_id ? state.people.find(x => x.id === p.person_id) : null;
+        const main = document.createElement('div'); main.className = 'drill-main';
+        main.textContent = p.email || '(no email on file)';
+        row.appendChild(main);
+        const meta = document.createElement('div'); meta.className = 'drill-meta';
+        meta.textContent = p.role === 'manager' ? 'Manager' : `Floor — ${person ? (person.name || '(unnamed)') : 'not linked to a person yet'}`;
+        row.appendChild(meta);
+        listWrap.appendChild(row);
+      });
+    }
+
+    const addHeading = document.createElement('div'); addHeading.style.marginTop = '16px'; addHeading.style.fontWeight = '700';
+    addHeading.textContent = 'Add a login';
+    panel.appendChild(addHeading);
+    const hint2 = document.createElement('div'); hint2.className = 'hint';
+    hint2.textContent = 'Creates a real sign-in — tell them the password yourself, they can\'t reset it from here.';
+    panel.appendChild(hint2);
+
+    const emailRow = document.createElement('div'); emailRow.className = 'field-row'; emailRow.style.marginTop = '8px';
+    const emailLabel = document.createElement('label'); emailLabel.textContent = 'Email'; emailRow.appendChild(emailLabel);
+    const emailInp = document.createElement('input'); emailInp.type = 'email'; emailRow.appendChild(emailInp);
+    panel.appendChild(emailRow);
+
+    const pwRow = document.createElement('div'); pwRow.className = 'field-row'; pwRow.style.marginTop = '6px';
+    const pwLabel = document.createElement('label'); pwLabel.textContent = 'Password'; pwRow.appendChild(pwLabel);
+    const pwInp = document.createElement('input'); pwInp.type = 'text'; pwInp.placeholder = 'Set one for them (min 6 characters)'; pwRow.appendChild(pwInp);
+    panel.appendChild(pwRow);
+
+    const roleRow = document.createElement('div'); roleRow.className = 'field-row'; roleRow.style.marginTop = '6px';
+    const roleLabel = document.createElement('label'); roleLabel.textContent = 'Role'; roleRow.appendChild(roleLabel);
+    const roleSel = document.createElement('select');
+    [['floor', 'Floor staff — only their own Job Card'], ['manager', 'Manager — full access']].forEach(([val, label]) => {
+      const opt = document.createElement('option'); opt.value = val; opt.textContent = label; roleSel.appendChild(opt);
+    });
+    roleRow.appendChild(roleSel);
+    panel.appendChild(roleRow);
+
+    const personRow = document.createElement('div'); personRow.className = 'field-row'; personRow.style.marginTop = '6px';
+    const personLabel = document.createElement('label'); personLabel.textContent = 'Which person (floor only)'; personRow.appendChild(personLabel);
+    const personSel = document.createElement('select');
+    const noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '— Not linked yet —';
+    personSel.appendChild(noneOpt);
+    sortedPeople().forEach(p => {
+      const opt = document.createElement('option'); opt.value = p.id; opt.textContent = p.name || '(unnamed)';
+      personSel.appendChild(opt);
+    });
+    personRow.appendChild(personSel);
+    panel.appendChild(personRow);
+
+    const addBtn = document.createElement('button'); addBtn.className = 'primary'; addBtn.style.marginTop = '10px';
+    addBtn.textContent = '+ Create login';
+    addBtn.addEventListener('click', async () => {
+      const email = emailInp.value.trim();
+      const password = pwInp.value;
+      if (!email || !password){ alert('Enter an email and password.'); return; }
+      if (password.length < 6){ alert('Password needs to be at least 6 characters.'); return; }
+      addBtn.disabled = true; addBtn.textContent = 'Creating…';
+      try {
+        const tempClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false, autoRefreshToken: false } });
+        const { data: signUpData, error: signUpErr } = await tempClient.auth.signUp({ email, password });
+        if (signUpErr) throw signUpErr;
+        const newUserId = signUpData.user && signUpData.user.id;
+        if (!newUserId) throw new Error('No account id came back — they may need to confirm their email first, or already have an account.');
+        const { error: profileErr } = await sb.from('profiles').upsert({
+          id: newUserId, email, role: roleSel.value, person_id: roleSel.value === 'floor' ? (personSel.value || null) : null
+        });
+        if (profileErr) throw profileErr;
+        alert(`Login created for ${email}. Give them the password you set — they can sign in now.`);
+        renderLoginsPage();
+      } catch (err) {
+        alert('Could not create login: ' + err.message);
+      } finally {
+        addBtn.disabled = false; addBtn.textContent = '+ Create login';
+      }
+    });
+    panel.appendChild(addBtn);
   }
 
   function migrateMaxHoursToPeople(oldVal){
@@ -4473,7 +4697,23 @@
     container.appendChild(dateWrap);
 
     const listPanel = document.createElement('div'); listPanel.className = 'panel'; listPanel.style.marginTop = '16px';
-    listPanel.innerHTML = '<h2>Employees</h2>';
+
+    // A floor login only ever sees their own linked person's card — no "Employees" list, no way to browse
+    // anyone else's. If their account isn't linked to a person yet, say so plainly instead of showing nothing.
+    const isFloor = currentProfile && currentProfile.role === 'floor';
+    if (isFloor){
+      listPanel.innerHTML = '<h2>Your Job Card</h2>';
+      const own = currentProfile.person_id ? state.people.find(p => p.id === currentProfile.person_id) : null;
+      if (!own){
+        const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
+        empty.textContent = 'Your login isn\'t linked to a person yet — ask your manager to link it in Logins.';
+        listPanel.appendChild(empty);
+        container.appendChild(listPanel);
+        return;
+      }
+    } else {
+      listPanel.innerHTML = '<h2>Employees</h2>';
+    }
 
     if (!state.people.length){
       const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
@@ -4488,7 +4728,9 @@
 
     const list = document.createElement('div'); list.className = 'drill-list'; list.style.marginTop = '10px';
     const allCardsToday = buildJobCardsForDate(date, allocByDate);
-    sortedPeople().forEach(p => {
+    const peopleToShow = isFloor ? state.people.filter(p => p.id === currentProfile.person_id) : sortedPeople();
+    peopleToShow.forEach(p => {
+      if (isFloor) jobCardsLiveExpanded.add(p.id); // always open — there's nothing else to pick from
       // A day's work only reaches the employee-facing Job Cards page once the manager has hit "Lock & send" for
       // that person/date in Job Card Setup — until then it's still just a plan, not dispatched.
       const sent = isPersonDateLocked(p.id, date);
@@ -5571,6 +5813,8 @@
     document.getElementById('page-archive').style.display = name === 'archive' ? '' : 'none';
     document.getElementById('page-reports').style.display = name === 'reports' ? '' : 'none';
     document.getElementById('page-signoff').style.display = name === 'signoff' ? '' : 'none';
+    document.getElementById('page-logins').style.display = name === 'logins' ? '' : 'none';
+    document.getElementById('navLogins').classList.toggle('active', name === 'logins');
     document.getElementById('navSchedule').classList.toggle('active', name === 'schedule');
     document.getElementById('navSetup').classList.toggle('active', name === 'setup');
     document.getElementById('navHistory').classList.toggle('active', name === 'history');
@@ -5589,7 +5833,9 @@
     if (name === 'archive') renderArchivePage();
     if (name === 'reports') renderReportsPage();
     if (name === 'signoff') renderSignoffPage();
+    if (name === 'logins') renderLoginsPage();
   }
+  document.getElementById('navLogins').addEventListener('click', () => showPage('logins'));
   document.getElementById('navSchedule').addEventListener('click', () => showPage('schedule'));
   document.getElementById('navSetup').addEventListener('click', () => showPage('setup'));
   document.getElementById('navHistory').addEventListener('click', () => showPage('history'));
@@ -5712,17 +5958,9 @@
     }
     renderSignoffFab();
   }
-  setInterval(autoRefreshVisiblePage, 5000);
 
-  renderAll();
-
-  // Local data renders immediately above (instant, offline-safe) — then check the shared copy right away rather
-  // than waiting for the first 5-second auto-refresh tick, so opening the app on a second device picks up
-  // whatever's already shared as fast as possible.
-  (async () => {
-    const pulled = await pullRemoteStateIfNewer();
-    if (pulled) renderAll();
-    syncReady = true; // now safe to let save() start pushing local edits back up
-  })();
+  // Everything before this point is just setup (functions, event listeners) — nothing renders or syncs until
+  // boot() confirms who's signed in. See the login & roles section above for what happens next.
+  boot();
 })();
 </script>
