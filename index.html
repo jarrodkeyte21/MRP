@@ -425,6 +425,8 @@
     <div style="margin-top:10px"><button class="ghost icon" id="btnAddPool">+ Add pool</button></div>
   </section>
 
+  <section class="row-gap" id="peopleSection"></section>
+
 </div>
 
 <div id="page-history" style="display:none">
@@ -1212,6 +1214,9 @@
       if (p.name === undefined) p.name = '';
       if (!Array.isArray(p.competencies)) p.competencies = [];
       p.competencies = p.competencies.filter(id => state.tasks.some(st => st.id === id));
+      // Supervisor is a plain flag, not a competency — it never touches state.tasks/pools/dependencies, it only
+      // unlocks the "Supervision / Training" option on that person's own Job Card (see renderAdHocForm).
+      if (typeof p.isSupervisor !== 'boolean') p.isSupervisor = false;
     });
     // Ad-hoc job cards (Job Cards tab) — one-off work assigned to a person for a specific date, not tied to
     // any build/job. Drop any whose person no longer exists.
@@ -1227,7 +1232,7 @@
       // 'normal' | 'lostTime' | 'rework' — how this entry shows on the card and reports. buildId/taskId link it
       // to a real job (and optionally a specific shop task) when picked from the dropdown rather than typed as
       // free text; both stay null for a pure one-off with no job link.
-      if (c.kind !== 'lostTime' && c.kind !== 'rework') c.kind = 'normal';
+      if (!['lostTime', 'rework', 'supervision'].includes(c.kind)) c.kind = 'normal';
       if (c.buildId && !state.builds.some(b => b.id === c.buildId)) c.buildId = null;
       if (c.buildId === undefined) c.buildId = null;
       if (c.taskId && !state.tasks.some(t => t.id === c.taskId)) c.taskId = null;
@@ -3296,7 +3301,10 @@
   }
 
   function adHocCardKindLabel(kind){
-    return kind === 'lostTime' ? 'Lost time' : kind === 'rework' ? 'Rework' : 'Ad-hoc';
+    if (kind === 'lostTime') return 'Lost time';
+    if (kind === 'rework') return 'Rework';
+    if (kind === 'supervision') return 'Supervision / Training';
+    return 'Ad-hoc';
   }
 
   // "Lost time — JB-1042 (Northern Ag / Riverbend) — waiting on parts" style title, adapting to however much of
@@ -3799,8 +3807,6 @@
     }
 
     container.appendChild(panel);
-
-    renderPeopleSection(container);
   }
 
   function renderEmployeesList(container){
@@ -4124,7 +4130,9 @@
     const kindLabel = document.createElement('label'); kindLabel.textContent = 'Type';
     kindRow.appendChild(kindLabel);
     const kindSel = document.createElement('select');
-    [['normal', 'Normal'], ['lostTime', 'Lost time'], ['rework', 'Rework']].forEach(([val, label]) => {
+    const kindOptions = [['normal', 'Normal'], ['lostTime', 'Lost time'], ['rework', 'Rework']];
+    if (person.isSupervisor) kindOptions.push(['supervision', 'Supervision / Training']);
+    kindOptions.forEach(([val, label]) => {
       const opt = document.createElement('option'); opt.value = val; opt.textContent = label;
       if (val === (defaults.kind || 'normal')) opt.selected = true;
       kindSel.appendChild(opt);
@@ -4341,6 +4349,7 @@
   // more than once keeps every session — the Reports tab lists them in order. The times inside each session
   // are the actual record and are meant to be corrected by hand whenever the button was forgotten. ----------
   let jobCardsLiveExpanded = new Set();
+  let peopleSectionExpanded = new Set();
   let jobCardsLiveSessionsExpanded = new Set();
 
   function nowTimeHHMM(){
@@ -5120,26 +5129,45 @@
     renderAdHocReportSection(container);
   }
 
+  // Shared checkbox-list builder for a person's shop-task competencies — used both for an existing person's
+  // editable list and the "add person" form's initial picks.
+  function buildCompetencyChecklist(selectedIds, onChange){
+    const wrap = document.createElement('div'); wrap.className = 'dep-list'; wrap.style.marginTop = '4px';
+    state.tasks.forEach(t => {
+      const label = document.createElement('label'); label.className = 'dep-item';
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = selectedIds.has(t.id);
+      cb.addEventListener('change', () => onChange(t.id, cb.checked));
+      label.appendChild(cb);
+      const span = document.createElement('span'); span.textContent = t.name;
+      label.appendChild(span);
+      wrap.appendChild(label);
+    });
+    return wrap;
+  }
+
   function renderPeopleSection(container){
+    if (!container) return;
+    container.innerHTML = '';
     const panel = document.createElement('div'); panel.className = 'panel'; panel.style.marginTop = '16px';
-    panel.innerHTML = '<h2>People</h2><div class="hint">Name and competencies (which Setup tasks they\'re qualified to run) — managed here, assigned from the Employees list above.</div>';
+    panel.innerHTML = '<h2>People</h2><div class="hint">Name, competencies (which shop tasks they\'re qualified to run), and whether they\'re a supervisor — click a person to edit. Assigned to jobs from Job Card Setup.</div>';
 
     if (state.people.length){
       const list = document.createElement('div'); list.className = 'drill-list'; list.style.marginTop = '10px';
       sortedPeople().forEach(p => {
-        const row = document.createElement('div'); row.className = 'drill-row'; row.style.cursor = 'default';
+        const expanded = peopleSectionExpanded.has(p.id);
+        const row = document.createElement('div'); row.className = 'drill-row';
+        row.addEventListener('click', () => {
+          if (expanded) peopleSectionExpanded.delete(p.id); else peopleSectionExpanded.add(p.id);
+          renderPeopleSection(container);
+        });
 
         const main = document.createElement('div'); main.className = 'drill-main';
-        const nameInp = document.createElement('input'); nameInp.type = 'text'; nameInp.value = p.name;
-        nameInp.placeholder = 'Name';
-        nameInp.addEventListener('click', (e) => e.stopPropagation());
-        nameInp.addEventListener('input', () => { p.name = nameInp.value; save(); });
-        main.appendChild(nameInp);
+        main.textContent = p.name || '(unnamed)';
         row.appendChild(main);
 
         const meta = document.createElement('div'); meta.className = 'drill-meta';
         const names = personCompetencyNames(p);
-        meta.textContent = names.length ? names.join(', ') : 'No competencies set';
+        meta.textContent = (p.isSupervisor ? 'Supervisor · ' : '') + (names.length ? names.join(', ') : 'No competencies set') + (expanded ? ' ▾' : ' ▸');
         row.appendChild(meta);
 
         const delBtn = document.createElement('button'); delBtn.className = 'icon ghost'; delBtn.textContent = '✕';
@@ -5154,10 +5182,43 @@
           });
           state.adHocCards = state.adHocCards.filter(c => c.personId !== p.id);
           if (jobCardsView.assignPersonId === p.id) { jobCardsView.level = 'list'; jobCardsView.assignPersonId = null; }
-          save(); renderJobCardsPage();
+          save(); renderJobCardsPage(); renderPeopleSection(container);
         });
         row.appendChild(delBtn);
         list.appendChild(row);
+
+        if (expanded){
+          const detail = document.createElement('div'); detail.style.padding = '4px 6px 14px 16px';
+
+          const nameRow = document.createElement('div'); nameRow.className = 'field-row';
+          const nameLabel = document.createElement('label'); nameLabel.textContent = 'Name'; nameRow.appendChild(nameLabel);
+          const nameInp = document.createElement('input'); nameInp.type = 'text'; nameInp.value = p.name;
+          nameInp.addEventListener('input', () => { p.name = nameInp.value; save(); });
+          nameRow.appendChild(nameInp);
+          detail.appendChild(nameRow);
+
+          const supRow = document.createElement('label'); supRow.className = 'dep-item'; supRow.style.marginTop = '8px';
+          const supCb = document.createElement('input'); supCb.type = 'checkbox'; supCb.checked = !!p.isSupervisor;
+          supCb.addEventListener('change', () => { p.isSupervisor = supCb.checked; save(); renderPeopleSection(container); });
+          supRow.appendChild(supCb);
+          const supSpan = document.createElement('span'); supSpan.textContent = 'Supervisor — unlocks Supervision / Training on their Job Card';
+          supRow.appendChild(supSpan);
+          detail.appendChild(supRow);
+
+          const compHeading = document.createElement('div'); compHeading.style.marginTop = '10px'; compHeading.style.fontWeight = '700';
+          compHeading.textContent = 'Competencies';
+          detail.appendChild(compHeading);
+          const selected = new Set(p.competencies || []);
+          detail.appendChild(buildCompetencyChecklist(selected, (taskId, checked) => {
+            if (!Array.isArray(p.competencies)) p.competencies = [];
+            const set = new Set(p.competencies);
+            if (checked) set.add(taskId); else set.delete(taskId);
+            p.competencies = Array.from(set);
+            save(); renderPeopleSection(container);
+          }));
+
+          list.appendChild(detail);
+        }
       });
       panel.appendChild(list);
     }
@@ -5173,29 +5234,28 @@
     nameRow.appendChild(newNameInp);
     panel.appendChild(nameRow);
 
+    const newSupRow = document.createElement('label'); newSupRow.className = 'dep-item'; newSupRow.style.marginTop = '8px';
+    const newSupCb = document.createElement('input'); newSupCb.type = 'checkbox';
+    newSupRow.appendChild(newSupCb);
+    const newSupSpan = document.createElement('span'); newSupSpan.textContent = 'Supervisor — unlocks Supervision / Training on their Job Card';
+    newSupRow.appendChild(newSupSpan);
+    panel.appendChild(newSupRow);
+
     const compHeading = document.createElement('div'); compHeading.style.marginTop = '8px';
     compHeading.textContent = 'Competencies';
     panel.appendChild(compHeading);
 
-    const compWrap = document.createElement('div'); compWrap.className = 'dep-list'; compWrap.style.marginTop = '4px';
     const checkedIds = new Set();
-    state.tasks.forEach(t => {
-      const label = document.createElement('label'); label.className = 'dep-item';
-      const cb = document.createElement('input'); cb.type = 'checkbox';
-      cb.addEventListener('change', () => { if (cb.checked) checkedIds.add(t.id); else checkedIds.delete(t.id); });
-      label.appendChild(cb);
-      const span = document.createElement('span'); span.textContent = t.name;
-      label.appendChild(span);
-      compWrap.appendChild(label);
-    });
-    panel.appendChild(compWrap);
+    panel.appendChild(buildCompetencyChecklist(checkedIds, (taskId, checked) => {
+      if (checked) checkedIds.add(taskId); else checkedIds.delete(taskId);
+    }));
 
     const addBtn = document.createElement('button'); addBtn.className = 'ghost icon'; addBtn.style.marginTop = '10px';
     addBtn.textContent = '+ Add person';
     addBtn.addEventListener('click', () => {
       if (!newNameInp.value.trim()) { alert('Enter a name first.'); return; }
-      state.people.push({ id: uid('per'), name: newNameInp.value.trim(), competencies: Array.from(checkedIds) });
-      save(); renderJobCardsPage();
+      state.people.push({ id: uid('per'), name: newNameInp.value.trim(), competencies: Array.from(checkedIds), isSupervisor: newSupCb.checked });
+      save(); renderJobCardsPage(); renderPeopleSection(container);
     });
     panel.appendChild(addBtn);
 
@@ -5793,6 +5853,7 @@
     renderTaskTable();
     renderPoolTimeline();
     renderPoolList();
+    renderPeopleSection(document.getElementById('peopleSection'));
     renderBuildTaskHeaders();
     renderBuildTable();
     renderResults();
@@ -5943,7 +6004,7 @@
     if (document.getElementById('page-schedule').style.display !== 'none'){
       renderBuildTable(); renderResults();
     } else if (document.getElementById('page-setup').style.display !== 'none'){
-      renderTaskTable(); renderPoolTimeline(); renderPoolList(); renderBuildTaskHeaders();
+      renderTaskTable(); renderPoolTimeline(); renderPoolList(); renderPeopleSection(document.getElementById('peopleSection')); renderBuildTaskHeaders();
     } else if (document.getElementById('page-history').style.display !== 'none'){
       renderJobHistory();
     } else if (document.getElementById('page-stock').style.display !== 'none'){
