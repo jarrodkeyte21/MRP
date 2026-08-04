@@ -5579,6 +5579,7 @@
         delBtn.title = 'Remove person';
         delBtn.addEventListener('click', (e) => {
           e.stopPropagation();
+          if (!confirm(`Delete ${p.name || 'this person'}? This also clears their job assignments and ad-hoc cards. This cannot be undone.`)) return;
           state.people = state.people.filter(x => x.id !== p.id);
           state.builds.forEach(b => {
             Object.keys(b.taskAssignments || {}).forEach(taskId => {
