@@ -114,6 +114,20 @@
   .jobcard-field { display: flex; flex-direction: column; gap: 2px; }
   .jobcard-field-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-muted); }
 
+  .subcard-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+  .subcard { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--surface-2); }
+  .subcard-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+  .subcard-name { font-weight: 600; font-size: 14.5px; }
+  .subcard-prefix { font-size: 11px; color: var(--ink-muted); margin-bottom: 1px; }
+  .subcard-meta { font-size: 12px; color: var(--ink-muted); white-space: nowrap; text-align: right; flex-shrink: 0; }
+  .subcard-notes { margin-top: 8px; }
+  .subcard-notes input[type="text"] { width: 100%; }
+  .subcard-note-text { font-size: 12px; color: var(--ink-muted); font-style: italic; }
+  .subcard-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .subcard-sessions { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
+  button.btn-lg { min-height: 44px; padding: 0 18px; font-size: 14px; }
+  button.btn-lg.icon-only { width: 44px; padding: 0; flex-shrink: 0; }
+
   button {
     font-family: var(--font-body); font-size: 12.5px; font-weight: 600; border-radius: 4px;
     border: 1px solid var(--line); background: var(--surface-2); color: var(--ink); padding: 6px 12px; cursor: pointer;
@@ -4496,6 +4510,7 @@
   let jobCardsLiveExpanded = new Set();
   let peopleSectionExpanded = new Set();
   let jobCardsLiveSessionsExpanded = new Set();
+  let jobCardsAddWorkExpanded = new Set();
 
   function nowTimeHHMM(){
     const d = new Date();
@@ -4609,111 +4624,85 @@
   // rows: [{ obj, number, name, notes, time, prefix }] — obj owns completed/timerRunning/timeLogs and gets
   // mutated directly (works for both real sub-tasks and ad-hoc cards, which share that shape). person/date
   // are whichever employee's card this table is rendered under, stamped onto new sessions the timer starts.
+  // Stacked touch-friendly cards, one per sub-task/ad-hoc row — replaces a dense multi-column table so this
+  // reads and taps cleanly on an iPad. Manual start/stop correction (previously two always-visible time inputs)
+  // now lives inside the "Sessions" expand along with every other logged session, since that already covers
+  // the same edit — no functionality lost, just tucked behind a tap.
   function renderSubtaskTimerTable(rows, person, date){
-    const hasDeletable = rows.some(r => r.onDelete);
-    const table = document.createElement('table'); table.className = 'editor'; table.style.marginTop = '10px';
-    table.innerHTML = '<thead><tr><th style="width:50px">#</th><th>Sub-task</th><th>Notes</th><th style="width:80px">Time allowed</th><th style="width:80px">Time used</th><th style="width:90px">Start time</th><th style="width:90px">Stop time</th><th style="width:110px">Sessions</th><th style="width:90px">Timer</th><th style="width:110px">Completed</th>' + (hasDeletable ? '<th style="width:40px"></th>' : '') + '</tr></thead>';
-    const tbody = document.createElement('tbody');
+    const list = document.createElement('div'); list.className = 'subcard-list';
     rows.forEach(r => {
       const obj = r.obj;
-      const tr = document.createElement('tr');
-      const tdNum = document.createElement('td'); tdNum.textContent = r.number || ''; tr.appendChild(tdNum);
-      const tdName = document.createElement('td'); tdName.textContent = (r.prefix ? r.prefix + ' — ' : '') + r.name; tr.appendChild(tdName);
-      const tdNotes = document.createElement('td');
+      const card = document.createElement('div'); card.className = 'subcard';
+
+      const top = document.createElement('div'); top.className = 'subcard-top';
+      const nameWrap = document.createElement('div');
+      if (r.prefix){ const pfx = document.createElement('div'); pfx.className = 'subcard-prefix'; pfx.textContent = r.prefix; nameWrap.appendChild(pfx); }
+      const nameEl = document.createElement('div'); nameEl.className = 'subcard-name';
+      nameEl.textContent = (r.number ? r.number + '. ' : '') + r.name;
+      nameWrap.appendChild(nameEl);
+      top.appendChild(nameWrap);
+
+      const meta = document.createElement('div'); meta.className = 'subcard-meta';
+      meta.textContent = `${totalTimeUsedHours(obj)}h of ${r.time}`;
+      top.appendChild(meta);
+      card.appendChild(top);
+
       if (r.onNoteChange){
-        const noteInp = document.createElement('input'); noteInp.type = 'text'; noteInp.value = r.notes || ''; noteInp.placeholder = 'Add a note…'; noteInp.style.width = '100%';
+        const notesWrap = document.createElement('div'); notesWrap.className = 'subcard-notes';
+        const noteInp = document.createElement('input'); noteInp.type = 'text'; noteInp.value = r.notes || ''; noteInp.placeholder = 'Add a note…';
         noteInp.addEventListener('input', () => r.onNoteChange(noteInp.value));
-        tdNotes.appendChild(noteInp);
-      } else {
-        tdNotes.textContent = r.notes || '';
+        notesWrap.appendChild(noteInp);
+        card.appendChild(notesWrap);
+      } else if (r.notes){
+        const notesWrap = document.createElement('div'); notesWrap.className = 'subcard-notes subcard-note-text'; notesWrap.textContent = r.notes;
+        card.appendChild(notesWrap);
       }
-      tr.appendChild(tdNotes);
-      const tdTime = document.createElement('td'); tdTime.textContent = r.time; tr.appendChild(tdTime);
-      const tdUsed = document.createElement('td'); tdUsed.textContent = totalTimeUsedHours(obj) + 'h'; tr.appendChild(tdUsed);
 
-      // Manual start/stop for *this date's* session — only needed if the Start/Stop button below was forgotten.
-      // Binds to the existing log entry for this date if there is one, otherwise creates one on first edit (not
-      // on render, so just opening the page never manufactures an empty session).
-      function todaysLog(createIfMissing){
-        let entry = [...obj.timeLogs].reverse().find(tl => tl.date === date);
-        if (!entry && createIfMissing){
-          entry = { id: uid('tl'), personId: person.id, date: date, startTime: '', stopTime: '' };
-          obj.timeLogs.push(entry);
-        }
-        return entry;
-      }
-      const existingLog = todaysLog(false);
+      const actions = document.createElement('div'); actions.className = 'subcard-actions';
 
-      const tdStart = document.createElement('td');
-      const startInp = document.createElement('input'); startInp.type = 'time';
-      startInp.value = existingLog ? (existingLog.startTime || '') : '';
-      startInp.title = 'Manual start time — only needed if the Start/Stop button was forgotten.';
-      startInp.addEventListener('change', () => { todaysLog(true).startTime = startInp.value; save(); renderJobCardsLivePage(); });
-      tdStart.appendChild(startInp); tr.appendChild(tdStart);
+      const timerBtn = document.createElement('button'); timerBtn.className = 'btn-lg ' + (obj.timerRunning ? 'primary' : 'ghost');
+      timerBtn.textContent = obj.timerRunning ? '⏹ Stop' : '▶ Start';
+      timerBtn.addEventListener('click', () => { toggleSubtaskTimer(obj, person.id, date, taskIdForTimerObj(obj)); renderJobCardsLivePage(); });
+      actions.appendChild(timerBtn);
 
-      const tdStop = document.createElement('td');
-      const stopInp = document.createElement('input'); stopInp.type = 'time';
-      stopInp.value = existingLog ? (existingLog.stopTime || '') : '';
-      stopInp.title = 'Manual stop time — only needed if the Start/Stop button was forgotten.';
-      stopInp.addEventListener('change', () => {
-        const entry = todaysLog(true);
-        entry.stopTime = stopInp.value;
-        if (stopInp.value && obj.timerRunning && !obj.timeLogs.some(tl => !tl.stopTime)) obj.timerRunning = false;
-        save(); renderJobCardsLivePage();
-      });
-      tdStop.appendChild(stopInp); tr.appendChild(tdStop);
+      const completeBtn = document.createElement('button'); completeBtn.className = 'btn-lg ' + (obj.completed ? 'primary' : 'ghost');
+      if (obj.completed){ completeBtn.style.background = 'var(--good)'; completeBtn.style.borderColor = 'var(--good)'; completeBtn.style.color = '#fff'; }
+      completeBtn.textContent = obj.completed ? '✓ Done' : 'Mark complete';
+      completeBtn.title = obj.completed ? 'Click to undo' : 'Mark this sub-task complete — it stays on the card, just ticked.';
+      completeBtn.addEventListener('click', () => { obj.completed = !obj.completed; save(); renderJobCardsLivePage(); });
+      actions.appendChild(completeBtn);
 
       const sessionsExpanded = jobCardsLiveSessionsExpanded.has(obj.id);
-      const tdSessions = document.createElement('td');
-      const sessionsBtn = document.createElement('button'); sessionsBtn.className = 'ghost icon';
       const n = obj.timeLogs.length;
+      const sessionsBtn = document.createElement('button'); sessionsBtn.className = 'ghost';
       sessionsBtn.textContent = `${n} session${n === 1 ? '' : 's'} ${sessionsExpanded ? '▾' : '▸'}`;
       sessionsBtn.addEventListener('click', () => {
         if (sessionsExpanded) jobCardsLiveSessionsExpanded.delete(obj.id); else jobCardsLiveSessionsExpanded.add(obj.id);
         renderJobCardsLivePage();
       });
-      tdSessions.appendChild(sessionsBtn); tr.appendChild(tdSessions);
+      actions.appendChild(sessionsBtn);
 
-      const tdTimer = document.createElement('td');
-      const timerBtn = document.createElement('button'); timerBtn.className = obj.timerRunning ? 'primary' : 'ghost icon';
-      timerBtn.textContent = obj.timerRunning ? '⏹ Stop' : '▶ Start';
-      timerBtn.addEventListener('click', () => { toggleSubtaskTimer(obj, person.id, date, taskIdForTimerObj(obj)); renderJobCardsLivePage(); });
-      tdTimer.appendChild(timerBtn); tr.appendChild(tdTimer);
-
-      const tdComplete = document.createElement('td');
-      const completeBtn = document.createElement('button'); completeBtn.className = obj.completed ? 'primary' : 'ghost icon';
-      if (obj.completed){ completeBtn.style.background = 'var(--good)'; completeBtn.style.borderColor = 'var(--good)'; completeBtn.style.color = '#fff'; }
-      completeBtn.textContent = obj.completed ? '✓ Completed' : 'Mark complete';
-      completeBtn.title = obj.completed ? 'Click to undo' : 'Mark this sub-task complete — it stays on the card, just ticked.';
-      completeBtn.addEventListener('click', () => { obj.completed = !obj.completed; save(); renderJobCardsLivePage(); });
-      tdComplete.appendChild(completeBtn); tr.appendChild(tdComplete);
-
-      if (hasDeletable){
-        const tdDel = document.createElement('td');
-        if (r.onDelete){
-          const delBtn = document.createElement('button'); delBtn.className = 'icon ghost'; delBtn.textContent = '✕';
-          delBtn.title = 'Remove this — e.g. if it was added by mistake.';
-          delBtn.addEventListener('click', () => {
-            if (!confirm(`Remove "${r.name}"? This can't be undone.`)) return;
-            r.onDelete();
-          });
-          tdDel.appendChild(delBtn);
-        }
-        tr.appendChild(tdDel);
+      if (r.onDelete){
+        const delBtn = document.createElement('button'); delBtn.className = 'btn-lg icon-only ghost'; delBtn.textContent = '✕';
+        delBtn.title = 'Remove this — e.g. if it was added by mistake.';
+        delBtn.addEventListener('click', () => {
+          if (!confirm(`Remove "${r.name}"? This can't be undone.`)) return;
+          r.onDelete();
+        });
+        actions.appendChild(delBtn);
       }
 
-      tbody.appendChild(tr);
+      card.appendChild(actions);
 
       if (sessionsExpanded){
-        const expandTr = document.createElement('tr');
-        const expandTd = document.createElement('td'); expandTd.colSpan = hasDeletable ? 11 : 10; expandTd.style.padding = '4px 0 10px 30px';
-        expandTd.appendChild(renderSessionLog(obj, person, date));
-        expandTr.appendChild(expandTd);
-        tbody.appendChild(expandTr);
+        const expandWrap = document.createElement('div'); expandWrap.className = 'subcard-sessions';
+        expandWrap.appendChild(renderSessionLog(obj, person, date));
+        card.appendChild(expandWrap);
       }
+
+      list.appendChild(card);
     });
-    table.appendChild(tbody);
-    return table;
+    return list;
   }
 
   // The per-sub-task session log: every clock-in as its own editable row (date/who/start/stop), plus a way
@@ -4832,7 +4821,7 @@
       jobSel.disabled = !!runningEntry; // locked to whichever job's session is currently running
       supRow.appendChild(jobSel);
 
-      const supBtn = document.createElement('button'); supBtn.className = runningEntry ? 'primary' : 'ghost icon';
+      const supBtn = document.createElement('button'); supBtn.className = 'btn-lg ' + (runningEntry ? 'primary' : 'ghost');
       supBtn.textContent = runningEntry ? '⏹ Stop' : '▶ Start';
       supRow.appendChild(supBtn);
 
@@ -4866,7 +4855,7 @@
       const fmLabel = document.createElement('div'); fmLabel.style.fontWeight = '700'; fmLabel.textContent = 'Factory Maintenance / Lost Time';
       fmRow.appendChild(fmLabel);
 
-      const fmBtn = document.createElement('button'); fmBtn.className = fmRunningEntry ? 'primary' : 'ghost icon';
+      const fmBtn = document.createElement('button'); fmBtn.className = 'btn-lg ' + (fmRunningEntry ? 'primary' : 'ghost');
       fmBtn.textContent = fmRunningEntry ? '⏹ Stop' : '▶ Start';
       fmRow.appendChild(fmBtn);
 
@@ -4908,7 +4897,7 @@
       titleRow.appendChild(titleH2);
       // Quick rework logging for a task already on the card — pre-fills the same job/task so the employee
       // doesn't have to re-pick them from the "Add work to this card" dropdowns below.
-      const reworkBtn = document.createElement('button'); reworkBtn.className = 'ghost icon';
+      const reworkBtn = document.createElement('button'); reworkBtn.className = 'btn-lg ghost';
       reworkBtn.textContent = '+ Rework';
       reworkBtn.title = 'Log rework hours against this same job/task.';
       reworkBtn.addEventListener('click', () => {
@@ -5030,16 +5019,32 @@
     }
 
     // Any job (scheduled today or not), optionally a specific task, and optionally tagged Lost time/Rework —
-    // deliberately at the very bottom of the card, after everything already on it.
-    const addWorkPanel = document.createElement('div'); addWorkPanel.className = 'panel'; addWorkPanel.style.marginTop = '10px';
-    renderAdHocForm(addWorkPanel, person, { date }, renderJobCardsLivePage);
-    container.appendChild(addWorkPanel);
+    // deliberately at the very bottom of the card, after everything already on it. Collapsed behind a button
+    // by default so an already-busy card doesn't open with a whole form visible — most days nobody needs it.
+    const addWorkExpanded = jobCardsAddWorkExpanded.has(person.id);
+    if (addWorkExpanded){
+      const addWorkPanel = document.createElement('div'); addWorkPanel.className = 'panel'; addWorkPanel.style.marginTop = '10px';
+      const closeRow = document.createElement('div'); closeRow.style.textAlign = 'right';
+      const closeBtn = document.createElement('button'); closeBtn.className = 'ghost'; closeBtn.textContent = 'Close';
+      closeBtn.addEventListener('click', () => { jobCardsAddWorkExpanded.delete(person.id); renderJobCardsLivePage(); });
+      closeRow.appendChild(closeBtn);
+      addWorkPanel.appendChild(closeRow);
+      renderAdHocForm(addWorkPanel, person, { date }, renderJobCardsLivePage);
+      container.appendChild(addWorkPanel);
+    } else {
+      const openWrap = document.createElement('div'); openWrap.style.marginTop = '10px'; openWrap.style.textAlign = 'center';
+      const openBtn = document.createElement('button'); openBtn.className = 'btn-lg ghost'; openBtn.style.width = '100%';
+      openBtn.textContent = '+ Add work to this card';
+      openBtn.addEventListener('click', () => { jobCardsAddWorkExpanded.add(person.id); renderJobCardsLivePage(); });
+      openWrap.appendChild(openBtn);
+      container.appendChild(openWrap);
+    }
 
     realContainer.appendChild(lockWrap);
 
     const footer = document.createElement('div'); footer.style.marginTop = '14px'; footer.style.textAlign = 'right';
     const finishBtn = document.createElement('button');
-    finishBtn.className = isFinished ? 'primary' : 'ghost';
+    finishBtn.className = 'btn-lg ' + (isFinished ? 'primary' : 'ghost');
     finishBtn.textContent = isFinished ? '✓ Day finished' : 'Day finished';
     finishBtn.title = isFinished ? 'Click to undo and unlock the card again.' : 'Mark your time card as finished for today — locks it and flags it ready for the manager to sign off.';
     finishBtn.addEventListener('click', () => {
