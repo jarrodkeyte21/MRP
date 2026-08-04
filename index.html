@@ -410,7 +410,7 @@
     <div class="hint">The shop tasks available and which resource pool each draws from. Add or remove steps freely — sequencing (what must finish before what) is set per job in the Jobs tab. Optionally set a backup pool — if that pool has spare hours left over once its own tasks are covered for the day, this task can draw on them too. Drag the ⠿ handle to reorder — earlier tasks get first claim on a shared pool each day.</div>
     <div class="scroll-x">
       <table class="editor" id="taskTable">
-        <thead><tr><th style="width:24px">#</th><th>Task name</th><th>Resource pool</th><th>Backup pool</th><th></th></tr></thead>
+        <thead><tr><th style="width:24px">#</th><th>Task name</th><th>Resource pool</th><th>Backup pool</th><th style="width:90px" title="Let one person clock on to two sub-tasks/jobs on this task at once, splitting overlapping time 50/50">Shared clock</th><th></th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -1111,6 +1111,12 @@
       if (t.secondaryPoolId === undefined) t.secondaryPoolId = null;
       if (t.secondaryPoolId === t.poolId) t.secondaryPoolId = null;
       if (t.secondaryPoolId && !state.pools.some(p => p.id === t.secondaryPoolId)) t.secondaryPoolId = null;
+      // Shared clock: lets one person run two sub-tasks/jobs at once on this task (e.g. two jobs loaded into
+      // the same blast cabinet or paint booth together) — normally a second concurrent timer is blocked, but
+      // for a shared-clock task it's allowed, and the overlapping time is split 50/50 between the two entries
+      // instead of double-counting (see logEntryHours). One-time auto-enable by name match on first ever load
+      // of a task, since that's the immediate real-world case — editable afterwards in Setup either way.
+      if (typeof t.sharedClock !== 'boolean') t.sharedClock = /blast|paint/i.test(t.name || '');
     });
     state.templates.forEach(t => {
       if (!t.dependsOn) t.dependsOn = {};
@@ -2125,6 +2131,12 @@
       secSel.title = 'If this pool has hours left over after its own tasks are covered that day, this task can use them too.';
       secSel.addEventListener('change', () => { t.secondaryPoolId = secSel.value || null; save(); renderResults(); });
       tdSecPool.appendChild(secSel); tr.appendChild(tdSecPool);
+
+      const tdShared = document.createElement('td'); tdShared.style.textAlign = 'center';
+      const sharedCb = document.createElement('input'); sharedCb.type = 'checkbox'; sharedCb.checked = !!t.sharedClock;
+      sharedCb.title = 'Let one person clock on to two sub-tasks/jobs on this task at once (e.g. two jobs loaded into the same blast cabinet or paint booth) — overlapping time splits 50/50 between them instead of double-counting.';
+      sharedCb.addEventListener('change', () => { t.sharedClock = sharedCb.checked; save(); });
+      tdShared.appendChild(sharedCb); tr.appendChild(tdShared);
 
       const tdDel = document.createElement('td');
       const del = document.createElement('button'); del.className = 'icon ghost'; del.textContent = '✕';
@@ -3493,7 +3505,7 @@
     let total = 0, any = false;
     (jrTask.subtasks || []).forEach(st => {
       (st.timeLogs || []).forEach(tl => {
-        if (tl.date === date){ any = true; total += logEntryHours(tl); }
+        if (tl.date === date){ any = true; total += logEntryHours(tl, st); }
       });
     });
     return any ? Math.round(total * 100) / 100 : null;
@@ -4397,37 +4409,59 @@
     return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
   }
 
-  // A person can only physically be doing one thing at a time — true if `personId` already has some other
-  // sub-task/ad-hoc card mid-session (timer running, no stop time yet) anywhere in the app.
-  function personHasRunningSession(personId, excludeObj){
-    const isOpenFor = (obj) => {
-      if (obj === excludeObj || !obj.timerRunning) return false;
-      const open = [...(obj.timeLogs || [])].reverse().find(tl => !tl.stopTime);
-      return !!open && open.personId === personId;
-    };
+  // Every sub-task/ad-hoc-card object that can carry a timer, paired with whichever real shop task it belongs
+  // to (null for ad-hoc entries with no task picked). Shared groundwork for the shared-clock overlap logic below.
+  function forEachTimerObj(callback){
     for (const jr of state.jobRecords){
       for (const t of jr.tasks || []){
         for (const st of t.subtasks || []){
-          if (isOpenFor(st)) return true;
+          callback(st, t.taskRefId || null);
         }
       }
     }
     for (const c of state.adHocCards){
-      if (isOpenFor(c)) return true;
+      callback(c, c.taskId || null);
     }
-    return false;
+  }
+  function taskIdForTimerObj(obj){
+    let found = null;
+    forEachTimerObj((o, taskId) => { if (o === obj) found = taskId; });
+    return found;
+  }
+  function isSharedClockTaskId(taskId){
+    const t = taskId ? state.tasks.find(x => x.id === taskId) : null;
+    return !!(t && t.sharedClock);
   }
 
-  function toggleSubtaskTimer(obj, personId, date){
+  // A person can only physically be doing one thing at a time — EXCEPT a shared-clock task (e.g. Blast/Paint),
+  // where the whole point is two jobs run together, so a second concurrent timer against another shared-clock
+  // task is allowed instead of blocked. Returns the blocking session's info if there is one, or null.
+  function personBlockingSession(personId, excludeObj, newTaskId){
+    const newIsShared = isSharedClockTaskId(newTaskId);
+    let found = null;
+    forEachTimerObj((obj, taskId) => {
+      if (found || obj === excludeObj || !obj.timerRunning) return;
+      const open = [...(obj.timeLogs || [])].reverse().find(tl => !tl.stopTime);
+      if (!open || open.personId !== personId) return;
+      if (newIsShared && isSharedClockTaskId(taskId)) return; // both shared-clock — allowed to run together
+      found = { obj, taskId };
+    });
+    return found;
+  }
+
+  function toggleSubtaskTimer(obj, personId, date, taskId){
     if (obj.timerRunning){
       const open = [...obj.timeLogs].reverse().find(tl => !tl.stopTime);
       if (open) open.stopTime = nowTimeHHMM();
       obj.timerRunning = false;
     } else {
-      if (personId && personHasRunningSession(personId, obj)){
-        const person = state.people.find(p => p.id === personId);
-        alert(`${person ? person.name : 'This person'} already has another sub-task's timer running — stop that one first.`);
-        return;
+      if (personId){
+        const blocking = personBlockingSession(personId, obj, taskId || null);
+        if (blocking){
+          const person = state.people.find(p => p.id === personId);
+          alert(`${person ? person.name : 'This person'} already has another sub-task's timer running — stop that one first.`);
+          return;
+        }
       }
       obj.timeLogs.push({ id: uid('tl'), personId: personId || null, date: date || null, startTime: nowTimeHHMM(), stopTime: '' });
       obj.timerRunning = true;
@@ -4435,19 +4469,48 @@
     save();
   }
 
-  function logEntryHours(tl){
+  function timeToMinutes(hhmm){
+    const [h, m] = hhmm.split(':').map(Number);
+    return h * 60 + m;
+  }
+
+  // `obj` is optional (existing callers that don't pass it just get the plain duration, unsplit) — when given
+  // and its task is shared-clock, any minute that overlaps another shared-clock session for the SAME person is
+  // credited at half value instead of double-counting two jobs run together in one blast/paint session. A
+  // still-running other session is treated as ending "now" for this purpose.
+  function logEntryHours(tl, obj){
     if (!tl.startTime || !tl.stopTime) return 0;
-    const [sh, sm] = tl.startTime.split(':').map(Number);
-    const [eh, em] = tl.stopTime.split(':').map(Number);
-    let mins = (eh * 60 + em) - (sh * 60 + sm);
-    if (mins < 0) mins += 24 * 60; // stop past midnight from start
-    return mins / 60;
+    let startMin = timeToMinutes(tl.startTime);
+    let endMin = timeToMinutes(tl.stopTime);
+    if (endMin < startMin) endMin += 24 * 60; // stop past midnight from start
+    const mins = endMin - startMin;
+    if (!obj) return mins / 60;
+
+    const taskId = taskIdForTimerObj(obj);
+    if (!isSharedClockTaskId(taskId)) return mins / 60;
+
+    let overlapMin = 0;
+    const nowMin = timeToMinutes(nowTimeHHMM());
+    forEachTimerObj((otherObj, otherTaskId) => {
+      if (otherObj === obj || !isSharedClockTaskId(otherTaskId)) return;
+      (otherObj.timeLogs || []).forEach(otherTl => {
+        if (otherTl === tl || otherTl.personId !== tl.personId || !otherTl.startTime) return;
+        let oStart = timeToMinutes(otherTl.startTime);
+        let oEnd = otherTl.stopTime ? timeToMinutes(otherTl.stopTime) : nowMin;
+        if (oEnd < oStart) oEnd += 24 * 60;
+        const ovStart = Math.max(startMin, oStart);
+        const ovEnd = Math.min(endMin, oEnd);
+        overlapMin += Math.max(0, ovEnd - ovStart);
+      });
+    });
+    overlapMin = Math.min(overlapMin, mins); // never split more than this session actually ran
+    return ((mins - overlapMin) + overlapMin * 0.5) / 60;
   }
 
   // Time used sums every logged session, regardless of whether it came from the timer button or a manual
   // entry — both live in the same timeLogs array, so this is always the current total.
   function totalTimeUsedHours(obj){
-    return Math.round((obj.timeLogs || []).reduce((sum, tl) => sum + logEntryHours(tl), 0) * 100) / 100;
+    return Math.round((obj.timeLogs || []).reduce((sum, tl) => sum + logEntryHours(tl, obj), 0) * 100) / 100;
   }
 
   // rows: [{ obj, number, name, notes, time, prefix }] — obj owns completed/timerRunning/timeLogs and gets
@@ -4521,7 +4584,7 @@
       const tdTimer = document.createElement('td');
       const timerBtn = document.createElement('button'); timerBtn.className = obj.timerRunning ? 'primary' : 'ghost icon';
       timerBtn.textContent = obj.timerRunning ? '⏹ Stop' : '▶ Start';
-      timerBtn.addEventListener('click', () => { toggleSubtaskTimer(obj, person.id, date); renderJobCardsLivePage(); });
+      timerBtn.addEventListener('click', () => { toggleSubtaskTimer(obj, person.id, date, taskIdForTimerObj(obj)); renderJobCardsLivePage(); });
       tdTimer.appendChild(timerBtn); tr.appendChild(tdTimer);
 
       const tdComplete = document.createElement('td');
@@ -4601,7 +4664,7 @@
         stopInp.addEventListener('change', () => { tl.stopTime = stopInp.value; save(); renderJobCardsLivePage(); });
         tdStop.appendChild(stopInp); tr.appendChild(tdStop);
 
-        const tdHours = document.createElement('td'); tdHours.textContent = Math.round(logEntryHours(tl) * 100) / 100 + 'h';
+        const tdHours = document.createElement('td'); tdHours.textContent = Math.round(logEntryHours(tl, obj) * 100) / 100 + 'h';
         tr.appendChild(tdHours);
 
         const tdDel = document.createElement('td');
@@ -4832,36 +4895,43 @@
       container.appendChild(totalRow);
     }
 
-    // One line per job supervised today, with hours totalled across every start/stop session against it —
-    // stopping the timer above (or a later session against the same job) just adds to these totals, it never
-    // adds a second line for a job already listed here.
+    // One card per job supervised today — shows as soon as they've clocked on at least once (not just once
+    // there's accumulated hours), so a comment can be added right away. A second session against a job already
+    // listed here adds to that same entry's total instead of creating a duplicate. Full row (note + delete),
+    // same treatment as Factory Maintenance / Lost Time and general ad-hoc work below.
     if (person.isSupervisor){
-      const supervisionEntries = state.adHocCards.filter(c => c.personId === person.id && c.date === date && c.kind === 'supervision' && totalTimeUsedHours(c) > 0);
+      const supervisionEntries = state.adHocCards.filter(c => c.personId === person.id && c.date === date && c.kind === 'supervision');
       if (supervisionEntries.length){
         const supDonePanel = document.createElement('div'); supDonePanel.className = 'panel'; supDonePanel.style.marginTop = '10px';
-        supDonePanel.innerHTML = '<h2>Supervision tasks completed</h2>';
+        supDonePanel.innerHTML = '<h2>Supervision</h2>';
         supervisionEntries.forEach(c => {
           const build = c.buildId ? state.builds.find(b => b.id === c.buildId) : null;
           const jobLabel = build ? jobIdentityLabel(effectiveBuildData(build).jobNumber, effectiveBuildData(build).dealer, effectiveBuildData(build).customer) : '(job removed)';
-          const row = document.createElement('div'); row.className = 'jobcard-field';
-          row.innerHTML = `<span class="jobcard-field-label">${jobLabel}</span><span>${totalTimeUsedHours(c)}h</span>`;
-          supDonePanel.appendChild(row);
+          supDonePanel.appendChild(renderSubtaskTimerTable([{
+            obj: c, number: '', name: jobLabel, notes: c.note, time: c.hours + 'h',
+            onNoteChange: (val) => { c.note = val; save(); },
+            onDelete: () => { state.adHocCards = state.adHocCards.filter(x => x.id !== c.id); save(); renderJobCardsLivePage(); }
+          }], person, date));
         });
         container.appendChild(supDonePanel);
       }
     }
 
-    // Same idea for Factory Maintenance / Lost Time — at most one entry per day (always the same fixed job),
-    // so at most one line, but the pattern (skip while empty, show once there's real logged time) stays
-    // consistent with Supervision above.
+    // At most one Factory Maintenance / Lost Time entry per day (always the same fixed job) — shows here the
+    // moment they've clocked on at least once today (not just once there's accumulated hours), so a comment can
+    // be added right away rather than only after stopping. Full row (note + delete), same as Lost Time/Rework
+    // below, not just a bare total — the Start/Stop button here duplicates the one at the top of the card, but
+    // both act on the same entry so either works.
     {
       const fmEntry = state.adHocCards.find(c => c.personId === person.id && c.date === date && c.kind === 'factoryMaintenance');
-      if (fmEntry && totalTimeUsedHours(fmEntry) > 0){
+      if (fmEntry){
         const fmDonePanel = document.createElement('div'); fmDonePanel.className = 'panel'; fmDonePanel.style.marginTop = '10px';
-        fmDonePanel.innerHTML = '<h2>Factory Maintenance / Lost Time completed</h2>';
-        const row = document.createElement('div'); row.className = 'jobcard-field';
-        row.innerHTML = `<span class="jobcard-field-label">Total today</span><span>${totalTimeUsedHours(fmEntry)}h</span>`;
-        fmDonePanel.appendChild(row);
+        fmDonePanel.innerHTML = '<h2>Factory Maintenance / Lost Time</h2>';
+        fmDonePanel.appendChild(renderSubtaskTimerTable([{
+          obj: fmEntry, number: '', name: fmEntry.description || 'Factory Maintenance / Lost Time', notes: fmEntry.note, time: fmEntry.hours + 'h',
+          onNoteChange: (val) => { fmEntry.note = val; save(); },
+          onDelete: () => { state.adHocCards = state.adHocCards.filter(x => x.id !== fmEntry.id); save(); renderJobCardsLivePage(); }
+        }], person, date));
         container.appendChild(fmDonePanel);
       }
     }
@@ -5111,7 +5181,7 @@
         });
         let subTotal = 0;
         sortedLogs.forEach(tl => {
-          const hrs = Math.round(logEntryHours(tl) * 100) / 100;
+          const hrs = Math.round(logEntryHours(tl, st) * 100) / 100;
           subTotal += hrs;
           const person = state.people.find(p => p.id === tl.personId);
           const tr = document.createElement('tr');
@@ -5184,7 +5254,7 @@
         if (ad !== bd) return ad < bd ? -1 : 1;
         return (a.startTime || '') < (b.startTime || '') ? -1 : 1;
       }).forEach(tl => {
-        const hrs = Math.round(logEntryHours(tl) * 100) / 100;
+        const hrs = Math.round(logEntryHours(tl, c) * 100) / 100;
         total += hrs;
         const tr = document.createElement('tr');
         tr.innerHTML = `<td>${adHocCardKindLabel(c.kind)}</td><td>${jobNum || '—'}</td><td>${c.description || '(no description)'}</td><td>${tl.date ? fmtDateLong(tl.date) : '—'}</td><td>${person ? person.name : '(unassigned)'}</td><td>${tl.startTime || '—'}</td><td>${tl.stopTime || '—'}</td><td>${hrs}h</td>`;
@@ -5213,7 +5283,7 @@
     entries.forEach(c => {
       (c.timeLogs || []).forEach(tl => {
         if (!tl.date) return;
-        const hrs = logEntryHours(tl);
+        const hrs = logEntryHours(tl, c);
         if (hrs <= 0) return;
         const monthKey = tl.date.slice(0, 7);
         if (!byMonth.has(monthKey)) byMonth.set(monthKey, new Map());
