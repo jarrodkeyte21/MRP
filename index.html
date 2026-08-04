@@ -3250,6 +3250,19 @@
   // sub-tasks off that person's card without touching the Jobs tab's own selected/hours data. ----------
   let jobCardsView = { level: 'list', date: getTodayISO(), assignPersonId: null, cardBuildId: null, cardTaskId: null, cardDate: null };
 
+  // A tab left open across midnight would otherwise keep showing yesterday's date forever, since
+  // jobCardsView.date is only ever set explicitly (by the date picker or this catch-up). Only nudges it forward
+  // if it was still tracking "today" — someone who deliberately navigated to a specific past/future date keeps
+  // seeing that date, this just stops "today" from silently going stale.
+  let lastKnownToday = jobCardsView.date;
+  function rolloverDateIfNeeded(){
+    const today = getTodayISO();
+    if (today !== lastKnownToday){
+      if (jobCardsView.date === lastKnownToday) jobCardsView.date = today;
+      lastKnownToday = today;
+    }
+  }
+
   // The oldest date still shown live — anything older belongs in the Archive tab.
   function jobCardsArchiveCutoff(){
     return toISO(addDays(parseISO(getTodayISO()), -2));
@@ -6463,6 +6476,7 @@
   // no stale event handlers are left pointing at detached objects. ----------
   async function autoRefreshVisiblePage(){
     if (document.hidden) return;
+    rolloverDateIfNeeded();
     const active = document.activeElement;
     const isEditing = active && ['INPUT', 'SELECT', 'TEXTAREA'].includes(active.tagName);
     if (isEditing || document.querySelector('.ctx-menu')) return;
