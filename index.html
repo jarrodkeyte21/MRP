@@ -4312,6 +4312,17 @@
     bottomRow.appendChild(hoursInp);
     panel.appendChild(bottomRow);
 
+    // Picking a known sub-task brings its own allowed time in as a starting point instead of leaving the
+    // generic default — still just a starting point, not locked, so it can be typed over if the real time
+    // differs.
+    subtaskSel.addEventListener('change', () => {
+      if (!subtaskSel.value) return;
+      const match = jobSubtasksForBuild(jobSel.value, taskSel.value || null).find(o => o.subtask.id === subtaskSel.value);
+      if (match && match.subtask.standardTime !== undefined && match.subtask.standardTime !== null){
+        hoursInp.value = String(match.subtask.standardTime);
+      }
+    });
+
     const addBtn = document.createElement('button'); addBtn.className = 'ghost icon'; addBtn.style.marginTop = '8px';
     addBtn.textContent = '+ Add to this card';
     addBtn.addEventListener('click', () => {
