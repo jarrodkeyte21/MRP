@@ -115,9 +115,9 @@
   .jobcard-field-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-muted); }
 
   .taskcard-head { display: flex; align-items: center; gap: 14px; }
-  .taskcard-jobnum { font-weight: 700; font-size: 16px; flex: 1; }
-  .taskcard-machine { font-size: 13px; color: var(--ink-muted); flex: 1; text-align: center; }
-  .taskcard-dealer { font-size: 13px; color: var(--ink-muted); flex: 1; text-align: right; }
+  .taskcard-jobnum { font-weight: 700; font-size: 20px; flex: 1; }
+  .taskcard-machine { font-weight: 700; font-size: 18px; color: var(--ink); flex: 1; text-align: center; }
+  .taskcard-dealer { font-weight: 700; font-size: 18px; color: var(--ink); flex: 1; text-align: right; }
   .taskcard-taskname { font-size: 13px; color: var(--ink-muted); margin-top: 2px; }
 
   .subcard-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
@@ -4671,13 +4671,6 @@
       timerBtn.addEventListener('click', () => { toggleSubtaskTimer(obj, person.id, date, taskIdForTimerObj(obj)); renderJobCardsLivePage(); });
       actions.appendChild(timerBtn);
 
-      const completeBtn = document.createElement('button'); completeBtn.className = 'btn-lg ' + (obj.completed ? 'primary' : 'ghost');
-      if (obj.completed){ completeBtn.style.background = 'var(--good)'; completeBtn.style.borderColor = 'var(--good)'; completeBtn.style.color = '#fff'; }
-      completeBtn.textContent = obj.completed ? '✓ Done' : 'Mark complete';
-      completeBtn.title = obj.completed ? 'Click to undo' : 'Mark this sub-task complete — it stays on the card, just ticked.';
-      completeBtn.addEventListener('click', () => { obj.completed = !obj.completed; save(); renderJobCardsLivePage(); });
-      actions.appendChild(completeBtn);
-
       const sessionsExpanded = jobCardsLiveSessionsExpanded.has(obj.id);
       const n = obj.timeLogs.length;
       const sessionsBtn = document.createElement('button'); sessionsBtn.className = 'ghost';
@@ -4688,9 +4681,18 @@
       });
       actions.appendChild(sessionsBtn);
 
+      // Mark complete and Delete are both "finish up" actions, not everyday ones — grouped together on the
+      // far right so they're never next to Start/Stop where a mis-tap would actually cost something.
+      const completeBtn = document.createElement('button'); completeBtn.className = 'btn-lg ' + (obj.completed ? 'primary' : 'ghost');
+      completeBtn.style.marginLeft = 'auto';
+      if (obj.completed){ completeBtn.style.background = 'var(--good)'; completeBtn.style.borderColor = 'var(--good)'; completeBtn.style.color = '#fff'; }
+      completeBtn.textContent = obj.completed ? '✓ Done' : 'Mark complete';
+      completeBtn.title = obj.completed ? 'Click to undo' : 'Mark this sub-task complete — it stays on the card, just ticked.';
+      completeBtn.addEventListener('click', () => { obj.completed = !obj.completed; save(); renderJobCardsLivePage(); });
+      actions.appendChild(completeBtn);
+
       if (r.onDelete){
         const delBtn = document.createElement('button'); delBtn.className = 'btn-lg icon-only ghost'; delBtn.textContent = '✕';
-        delBtn.style.marginLeft = 'auto'; // pushed to the far right, away from the buttons tapped every day
         delBtn.title = 'Remove this — e.g. if it was added by mistake.';
         delBtn.addEventListener('click', () => {
           if (!confirm(`Remove "${r.name}"? This can't be undone.`)) return;
@@ -4732,16 +4734,24 @@
         tdDate.appendChild(dateInp); tr.appendChild(tdDate);
 
         const tdWho = document.createElement('td');
-        const whoSel = document.createElement('select');
-        const noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '(unassigned)';
-        whoSel.appendChild(noneOpt);
-        sortedPeople().forEach(p => {
-          const opt = document.createElement('option'); opt.value = p.id; opt.textContent = p.name || '(unnamed)';
-          if (tl.personId === p.id) opt.selected = true;
-          whoSel.appendChild(opt);
-        });
-        whoSel.addEventListener('change', () => { tl.personId = whoSel.value || null; save(); });
-        tdWho.appendChild(whoSel); tr.appendChild(tdWho);
+        // Reassigning a session to someone else is a manager-only move — floor logins just see who it's under.
+        const isFloor = currentProfile && currentProfile.role === 'floor';
+        if (isFloor){
+          const who = tl.personId ? state.people.find(p => p.id === tl.personId) : null;
+          tdWho.textContent = who ? (who.name || '(unnamed)') : '(unassigned)';
+        } else {
+          const whoSel = document.createElement('select');
+          const noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '(unassigned)';
+          whoSel.appendChild(noneOpt);
+          sortedPeople().forEach(p => {
+            const opt = document.createElement('option'); opt.value = p.id; opt.textContent = p.name || '(unnamed)';
+            if (tl.personId === p.id) opt.selected = true;
+            whoSel.appendChild(opt);
+          });
+          whoSel.addEventListener('change', () => { tl.personId = whoSel.value || null; save(); });
+          tdWho.appendChild(whoSel);
+        }
+        tr.appendChild(tdWho);
 
         const tdStart = document.createElement('td');
         const startInp = document.createElement('input'); startInp.type = 'time'; startInp.value = tl.startTime || '';
@@ -4888,6 +4898,11 @@
       container.appendChild(fmPanel);
     }
 
+    // Rework logged against a job/task that's already on the card gets folded into that task's own sub-task
+    // list (bottom row) instead of showing as its own separate panel — tidier, and it's obviously the same
+    // job. Tracked by id so the generic ad-hoc panel loop below can skip anything already shown this way.
+    const attachedAdHocIds = new Set();
+
     function renderTaskCard(c, pulled){
       const raw = state.builds.find(b => b.id === c.buildId);
       const jrTask = jobCardSourceTask(raw, c.taskId);
@@ -4929,15 +4944,27 @@
       taskNameEl.textContent = c.taskName + (pulled ? ' (scheduled ' + fmtDateLong(c.pulledFromDate) + ')' : '');
       cardPanel.appendChild(taskNameEl);
 
-      if (checklist.length === 0){
+      // Rework already logged against this exact job/task rides along at the bottom of its checklist instead
+      // of getting its own separate panel further down the page — same job, so it belongs with it.
+      const reworkRows = adHoc.filter(rw => rw.kind === 'rework' && rw.buildId === c.buildId && rw.taskId === c.taskId).map(rw => {
+        attachedAdHocIds.add(rw.id);
+        return {
+          obj: rw, number: '', name: rw.description || adHocCardKindLabel(rw.kind), notes: rw.note, time: rw.hours + 'h',
+          onNoteChange: (val) => { rw.note = val; save(); },
+          onDelete: () => { state.adHocCards = state.adHocCards.filter(x => x.id !== rw.id); save(); renderJobCardsLivePage(); }
+        };
+      });
+      const checklistRows = checklist.map(st => ({
+        obj: st, number: st.number, name: st.name, notes: st.notes, time: st.standardTime + 'h'
+      }));
+
+      if (checklistRows.length === 0 && reworkRows.length === 0){
         const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
         empty.textContent = 'No checklist items for this task — just the hours above.';
         cardPanel.appendChild(empty);
       } else {
         subtaskHoursTotal += checklist.reduce((sum, st) => sum + (Number(st.standardTime) || 0), 0);
-        cardPanel.appendChild(renderSubtaskTimerTable(checklist.map(st => ({
-          obj: st, number: st.number, name: st.name, notes: st.notes, time: st.standardTime + 'h'
-        })), person, date));
+        cardPanel.appendChild(renderSubtaskTimerTable(checklistRows.concat(reworkRows), person, date));
       }
       // A secondary (doubled-up) assignee can drop themselves back off this task from their own active card —
       // the primary assignee's card has no such option, since removing the last assignee should happen by
@@ -4958,8 +4985,9 @@
 
     // Supervision and Factory Maintenance / Lost Time entries each get their own Start/Stop control (top of
     // card) and completed-summary (bottom of card) instead — see those blocks — so they're deliberately
-    // skipped here to avoid showing twice.
-    adHoc.filter(c => c.kind !== 'supervision' && c.kind !== 'factoryMaintenance').forEach(c => {
+    // skipped here to avoid showing twice. Rework already folded into its matching task card above (see
+    // attachedAdHocIds) is skipped for the same reason — one job, one card.
+    adHoc.filter(c => c.kind !== 'supervision' && c.kind !== 'factoryMaintenance' && !attachedAdHocIds.has(c.id)).forEach(c => {
       const cardPanel = document.createElement('div'); cardPanel.className = 'panel'; cardPanel.style.marginTop = '10px';
       cardPanel.innerHTML = `<h2>${adHocCardTitle(c)}</h2>`;
       cardPanel.appendChild(renderSubtaskTimerTable([{
