@@ -114,10 +114,10 @@
   .jobcard-field { display: flex; flex-direction: column; gap: 2px; }
   .jobcard-field-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-muted); }
 
-  .taskcard-head { display: flex; align-items: center; gap: 14px; }
-  .taskcard-jobnum { font-weight: 700; font-size: 20px; flex: 1; }
-  .taskcard-machine { font-weight: 700; font-size: 18px; color: var(--ink); flex: 1; text-align: center; }
-  .taskcard-dealer { font-weight: 700; font-size: 18px; color: var(--ink); flex: 1; text-align: right; }
+  .taskcard-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .taskcard-jobnum { font-weight: 700; font-size: 40px; line-height: 1.1; flex: 1; }
+  .taskcard-machine { font-weight: 700; font-size: 36px; line-height: 1.1; color: var(--ink); flex: 1; text-align: center; }
+  .taskcard-dealer { font-weight: 700; font-size: 36px; line-height: 1.1; color: var(--ink); flex: 1; text-align: right; }
   .taskcard-taskname { font-size: 13px; color: var(--ink-muted); margin-top: 2px; }
 
   .subcard-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
@@ -129,7 +129,8 @@
   .subcard-notes { margin-top: 8px; }
   .subcard-notes input[type="text"] { width: 100%; }
   .subcard-note-text { font-size: 12px; color: var(--ink-muted); font-style: italic; }
-  .subcard-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .subcard-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .subcard-actions-right { display: flex; align-items: center; gap: 8px; }
   .subcard-sessions { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
   button.btn-lg { min-height: 44px; padding: 0 18px; font-size: 14px; }
   button.btn-lg.icon-only { width: 44px; padding: 0; flex-shrink: 0; }
@@ -4645,8 +4646,10 @@
       const top = document.createElement('div'); top.className = 'subcard-top';
       const nameWrap = document.createElement('div');
       if (r.prefix){ const pfx = document.createElement('div'); pfx.className = 'subcard-prefix'; pfx.textContent = r.prefix; nameWrap.appendChild(pfx); }
+      // Floor doesn't need the sub-task's setup-sheet number in front of them — just the name.
+      const showNumber = r.number && !(currentProfile && currentProfile.role === 'floor');
       const nameEl = document.createElement('div'); nameEl.className = 'subcard-name';
-      nameEl.textContent = (r.number ? r.number + '. ' : '') + r.name;
+      nameEl.textContent = (showNumber ? r.number + '. ' : '') + r.name;
       nameWrap.appendChild(nameEl);
       top.appendChild(nameWrap);
 
@@ -4668,11 +4671,18 @@
 
       const actions = document.createElement('div'); actions.className = 'subcard-actions';
 
-      const timerBtn = document.createElement('button'); timerBtn.className = 'btn-lg ' + (obj.timerRunning ? 'primary' : 'ghost');
+      // Start (green) and Stop (red) are the two most-tapped, most-important actions on the card — filled with
+      // strong, unambiguous colour so they're never mistaken for a secondary button.
+      const timerBtn = document.createElement('button'); timerBtn.className = 'btn-lg';
+      timerBtn.style.color = '#fff'; timerBtn.style.fontWeight = '700';
+      if (obj.timerRunning){ timerBtn.style.background = 'var(--critical)'; timerBtn.style.borderColor = 'var(--critical)'; }
+      else { timerBtn.style.background = 'var(--good)'; timerBtn.style.borderColor = 'var(--good)'; }
       timerBtn.textContent = obj.timerRunning ? '⏹ Stop' : '▶ Start';
       timerBtn.addEventListener('click', () => { toggleSubtaskTimer(obj, person.id, date, taskIdForTimerObj(obj)); renderJobCardsLivePage(); });
       actions.appendChild(timerBtn);
 
+      // Sessions sits on its own in the middle — deliberately not next to Start/Stop, so reaching for it can't
+      // accidentally hit (or be hit by) the Start/Stop tap.
       const sessionsExpanded = jobCardsLiveSessionsExpanded.has(obj.id);
       const n = obj.timeLogs.length;
       const sessionsBtn = document.createElement('button'); sessionsBtn.className = 'ghost';
@@ -4685,13 +4695,16 @@
 
       // Mark complete and Delete are both "finish up" actions, not everyday ones — grouped together on the
       // far right so they're never next to Start/Stop where a mis-tap would actually cost something.
-      const completeBtn = document.createElement('button'); completeBtn.className = 'btn-lg ' + (obj.completed ? 'primary' : 'ghost');
-      completeBtn.style.marginLeft = 'auto';
+      const rightGroup = document.createElement('div'); rightGroup.className = 'subcard-actions-right';
+
+      const completeBtn = document.createElement('button'); completeBtn.className = 'btn-lg';
+      completeBtn.style.fontWeight = '700';
       if (obj.completed){ completeBtn.style.background = 'var(--good)'; completeBtn.style.borderColor = 'var(--good)'; completeBtn.style.color = '#fff'; }
+      else { completeBtn.style.background = 'transparent'; completeBtn.style.borderColor = 'var(--accent)'; completeBtn.style.borderWidth = '2px'; completeBtn.style.color = 'var(--accent)'; }
       completeBtn.textContent = obj.completed ? '✓ Done' : 'Mark complete';
       completeBtn.title = obj.completed ? 'Click to undo' : 'Mark this sub-task complete — it stays on the card, just ticked.';
       completeBtn.addEventListener('click', () => { obj.completed = !obj.completed; save(); renderJobCardsLivePage(); });
-      actions.appendChild(completeBtn);
+      rightGroup.appendChild(completeBtn);
 
       if (r.onDelete){
         const delBtn = document.createElement('button'); delBtn.className = 'btn-lg icon-only ghost'; delBtn.textContent = '✕';
@@ -4700,9 +4713,10 @@
           if (!confirm(`Remove "${r.name}"? This can't be undone.`)) return;
           r.onDelete();
         });
-        actions.appendChild(delBtn);
+        rightGroup.appendChild(delBtn);
       }
 
+      actions.appendChild(rightGroup);
       card.appendChild(actions);
 
       if (sessionsExpanded){
