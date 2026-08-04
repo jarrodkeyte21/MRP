@@ -367,7 +367,7 @@
 
 <div id="appShell" style="display:none">
 <header class="top">
-  <div>
+  <div id="appHeaderText">
     <div class="eyebrow">Southern Spreaders — Production</div>
     <h1>Floor Schedule</h1>
     <div class="sub">Sequences builds across shop tasks against daily hour capacity, using each machine type's own task order.</div>
@@ -944,6 +944,8 @@
     const role = currentProfile ? currentProfile.role : null;
     const isManager = role === 'manager';
     document.getElementById('navLogins').style.display = isManager ? '' : 'none';
+    // Floor doesn't need the branded page header at all — one less thing between them and their card.
+    document.getElementById('appHeaderText').style.display = (role === 'floor') ? 'none' : '';
     document.getElementById('whoAmI').textContent = currentSession
       ? `${currentSession.user.email}${role ? ' (' + role + ')' : ''}`
       : '';
@@ -5009,7 +5011,8 @@
       container.appendChild(pulledPanel);
     }
 
-    if (cards.length || pulledTasks.length || pulledSubs.length){
+    const isFloorView = currentProfile && currentProfile.role === 'floor';
+    if (!isFloorView && (cards.length || pulledTasks.length || pulledSubs.length)){
       const totalRow = document.createElement('div'); totalRow.className = 'jobcard-field'; totalRow.style.marginTop = '10px';
       totalRow.innerHTML = `<span class="jobcard-field-label">Hours from sub-tasks selected</span><span>${Math.round(subtaskHoursTotal * 100) / 100}h</span>`;
       container.appendChild(totalRow);
@@ -5086,6 +5089,11 @@
     finishBtn.textContent = isFinished ? '✓ Day finished' : 'Day finished';
     finishBtn.title = isFinished ? 'Click to undo and unlock the card again.' : 'Mark your time card as finished for today — locks it and flags it ready for the manager to sign off.';
     finishBtn.addEventListener('click', () => {
+      if (!isFinished){
+        if (!confirm('Have you finished working for the day? This will lock your card.')) return;
+      } else {
+        if (!confirm('This will unlock your card and clock you back in for today. Continue?')) return;
+      }
       if (!state.dayFinished[date]) state.dayFinished[date] = {};
       state.dayFinished[date][person.id] = !isFinished;
       save(); renderJobCardsLivePage(); renderSignoffFab();
@@ -5098,16 +5106,20 @@
     const container = document.getElementById('jobCardsLiveSection');
     container.innerHTML = '';
 
-    const dateWrap = document.createElement('div'); dateWrap.className = 'panel';
-    dateWrap.innerHTML = '<h2>Job Cards</h2><div class="hint">What each employee sees for the selected date — everything assigned or pulled to them, with start/stop time tracking and completion per sub-task.</div>';
-    renderJobCardsDatePicker(dateWrap, renderJobCardsLivePage);
-    container.appendChild(dateWrap);
-
-    const listPanel = document.createElement('div'); listPanel.className = 'panel'; listPanel.style.marginTop = '16px';
-
     // A floor login only ever sees their own linked person's card — no "Employees" list, no way to browse
     // anyone else's. If their account isn't linked to a person yet, say so plainly instead of showing nothing.
     const isFloor = currentProfile && currentProfile.role === 'floor';
+
+    // Floor doesn't get to pick a date at all — always today, no picker — so there's no "Date" panel for them.
+    if (!isFloor){
+      const dateWrap = document.createElement('div'); dateWrap.className = 'panel';
+      dateWrap.innerHTML = '<h2>Job Cards</h2><div class="hint">What each employee sees for the selected date — everything assigned or pulled to them, with start/stop time tracking and completion per sub-task.</div>';
+      renderJobCardsDatePicker(dateWrap, renderJobCardsLivePage);
+      container.appendChild(dateWrap);
+    }
+
+    const listPanel = document.createElement('div'); listPanel.className = 'panel'; listPanel.style.marginTop = '16px';
+
     if (isFloor){
       listPanel.innerHTML = '<h2>Your Job Card</h2>';
       const own = currentProfile.person_id ? state.people.find(p => p.id === currentProfile.person_id) : null;
@@ -5131,7 +5143,7 @@
     }
 
     const allocByDate = computeAllocationsByDate();
-    const date = jobCardsView.date;
+    const date = isFloor ? getTodayISO() : jobCardsView.date;
 
     const list = document.createElement('div'); list.className = 'drill-list'; list.style.marginTop = '10px';
     const allCardsToday = buildJobCardsForDate(date, allocByDate);
@@ -5155,6 +5167,15 @@
       // Planned-but-not-sent work still counts toward this, purely so the row can say "not sent yet" instead of
       // looking like there's simply nothing scheduled for this person today.
       const plannedCount = !sent ? allCardsToday.filter(c => isCardForPerson(c, p.id)).length : 0;
+
+      // Floor has nothing else to pick from and doesn't need their own name in front of them — skip straight
+      // to the card content instead of a clickable name/hours row.
+      if (isFloor){
+        const cardWrap = document.createElement('div'); cardWrap.style.padding = '4px 6px 16px 6px';
+        renderEmployeeJobCard(cardWrap, p, date, { cards, pulledTasks, adHoc, pulledSubs });
+        list.appendChild(cardWrap);
+        return;
+      }
 
       const row = document.createElement('div'); row.className = 'drill-row';
       const main = document.createElement('div'); main.className = 'drill-main';
