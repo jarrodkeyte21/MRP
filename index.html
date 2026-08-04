@@ -3320,6 +3320,18 @@
     return parts.join(' — ');
   }
 
+  // One supervision entry per (person, date, job) — starting a second session against the same job on the
+  // same day reuses the existing entry (and its timeLogs) instead of creating a duplicate, so the hours
+  // naturally accumulate into one line rather than splitting into several.
+  function findOrCreateSupervisionEntry(personId, date, buildId){
+    let entry = state.adHocCards.find(c => c.personId === personId && c.date === date && c.kind === 'supervision' && c.buildId === buildId);
+    if (!entry){
+      entry = { id: uid('adhoc'), personId, date, description: '', note: '', buildId, taskId: null, kind: 'supervision', jobNumber: '', hours: 0, completed: false, timeLogs: [], timerRunning: false };
+      state.adHocCards.push(entry);
+    }
+    return entry;
+  }
+
   function isPersonDateLocked(personId, date){
     return !!(state.jobCardLocks[personId] && state.jobCardLocks[personId][date]);
   }
@@ -4130,8 +4142,9 @@
     const kindLabel = document.createElement('label'); kindLabel.textContent = 'Type';
     kindRow.appendChild(kindLabel);
     const kindSel = document.createElement('select');
+    // Supervision has its own dedicated Start/Stop control at the top of a supervisor's card (see
+    // renderEmployeeJobCard) instead of going through this generic form.
     const kindOptions = [['normal', 'Normal'], ['lostTime', 'Lost time'], ['rework', 'Rework']];
-    if (person.isSupervisor) kindOptions.push(['supervision', 'Supervision / Training']);
     kindOptions.forEach(([val, label]) => {
       const opt = document.createElement('option'); opt.value = val; opt.textContent = label;
       if (val === (defaults.kind || 'normal')) opt.selected = true;
@@ -4590,6 +4603,54 @@
     const realContainer = container;
     container = lockWrap;
 
+    // Supervisors get a dedicated Start/Stop control pinned to the top of their own card — pick a job, hit
+    // Start, hit Stop when done. Reuses the same timer machinery as everything else (toggleSubtaskTimer),
+    // just against a "supervision" ad-hoc entry instead of a sub-task, so it shares the same one-timer-at-a-time
+    // guard as the rest of the card.
+    if (person.isSupervisor){
+      const runningEntry = state.adHocCards.find(c => c.personId === person.id && c.date === date && c.kind === 'supervision' && c.timerRunning);
+      const supPanel = document.createElement('div'); supPanel.className = 'panel';
+      const supRow = document.createElement('div'); supRow.style.display = 'flex'; supRow.style.alignItems = 'center'; supRow.style.gap = '10px'; supRow.style.flexWrap = 'wrap';
+      const supLabel = document.createElement('div'); supLabel.style.fontWeight = '700'; supLabel.textContent = 'Supervision';
+      supRow.appendChild(supLabel);
+
+      const jobSel = document.createElement('select');
+      const noJobOpt = document.createElement('option'); noJobOpt.value = ''; noJobOpt.textContent = '— Select job —';
+      jobSel.appendChild(noJobOpt);
+      state.builds.filter(b => !b.archived).forEach(b => {
+        const eff = effectiveBuildData(b);
+        const opt = document.createElement('option'); opt.value = b.id; opt.textContent = jobIdentityLabel(eff.jobNumber, eff.dealer, eff.customer);
+        if (runningEntry && runningEntry.buildId === b.id) opt.selected = true;
+        jobSel.appendChild(opt);
+      });
+      jobSel.disabled = !!runningEntry; // locked to whichever job's session is currently running
+      supRow.appendChild(jobSel);
+
+      const supBtn = document.createElement('button'); supBtn.className = runningEntry ? 'primary' : 'ghost icon';
+      supBtn.textContent = runningEntry ? '⏹ Stop' : '▶ Start';
+      supRow.appendChild(supBtn);
+
+      const supTimeInfo = document.createElement('span'); supTimeInfo.className = 'hint';
+      if (runningEntry){
+        const openLog = [...runningEntry.timeLogs].reverse().find(tl => !tl.stopTime);
+        supTimeInfo.textContent = openLog ? `Started ${openLog.startTime}` : '';
+      }
+      supRow.appendChild(supTimeInfo);
+
+      supBtn.addEventListener('click', () => {
+        if (runningEntry){
+          toggleSubtaskTimer(runningEntry, person.id, date);
+        } else {
+          if (!jobSel.value){ alert('Pick a job first.'); return; }
+          toggleSubtaskTimer(findOrCreateSupervisionEntry(person.id, date, jobSel.value), person.id, date);
+        }
+        renderJobCardsLivePage();
+      });
+
+      supPanel.appendChild(supRow);
+      container.appendChild(supPanel);
+    }
+
     function renderTaskCard(c, pulled){
       const raw = state.builds.find(b => b.id === c.buildId);
       const jrTask = jobCardSourceTask(raw, c.taskId);
@@ -4655,7 +4716,9 @@
     cards.forEach(c => renderTaskCard(c, false));
     pulledTasks.forEach(c => renderTaskCard(c, true));
 
-    adHoc.forEach(c => {
+    // Supervision entries get their own Start/Stop control (top of card) and completed-summary (bottom of
+    // card) instead — see those two blocks — so they're deliberately skipped here to avoid showing twice.
+    adHoc.filter(c => c.kind !== 'supervision').forEach(c => {
       const cardPanel = document.createElement('div'); cardPanel.className = 'panel'; cardPanel.style.marginTop = '10px';
       cardPanel.innerHTML = `<h2>${adHocCardTitle(c)}</h2>`;
       cardPanel.appendChild(renderSubtaskTimerTable([{ obj: c, number: '', name: c.description || adHocCardKindLabel(c.kind), notes: c.note, time: c.hours + 'h' }], person, date));
@@ -4677,6 +4740,25 @@
       const totalRow = document.createElement('div'); totalRow.className = 'jobcard-field'; totalRow.style.marginTop = '10px';
       totalRow.innerHTML = `<span class="jobcard-field-label">Hours from sub-tasks selected</span><span>${Math.round(subtaskHoursTotal * 100) / 100}h</span>`;
       container.appendChild(totalRow);
+    }
+
+    // One line per job supervised today, with hours totalled across every start/stop session against it —
+    // stopping the timer above (or a later session against the same job) just adds to these totals, it never
+    // adds a second line for a job already listed here.
+    if (person.isSupervisor){
+      const supervisionEntries = state.adHocCards.filter(c => c.personId === person.id && c.date === date && c.kind === 'supervision' && totalTimeUsedHours(c) > 0);
+      if (supervisionEntries.length){
+        const supDonePanel = document.createElement('div'); supDonePanel.className = 'panel'; supDonePanel.style.marginTop = '10px';
+        supDonePanel.innerHTML = '<h2>Supervision tasks completed</h2>';
+        supervisionEntries.forEach(c => {
+          const build = c.buildId ? state.builds.find(b => b.id === c.buildId) : null;
+          const jobLabel = build ? jobIdentityLabel(effectiveBuildData(build).jobNumber, effectiveBuildData(build).dealer, effectiveBuildData(build).customer) : '(job removed)';
+          const row = document.createElement('div'); row.className = 'jobcard-field';
+          row.innerHTML = `<span class="jobcard-field-label">${jobLabel}</span><span>${totalTimeUsedHours(c)}h</span>`;
+          supDonePanel.appendChild(row);
+        });
+        container.appendChild(supDonePanel);
+      }
     }
 
     // Any job (scheduled today or not), optionally a specific task, and optionally tagged Lost time/Rework —
