@@ -932,6 +932,11 @@
     // sign-off step for themselves. The FAB is the only way into that page (it's outside .pagenav), so hiding it
     // removes the only path there.
     document.getElementById('signoffFab').style.display = isManager ? '' : 'none';
+    // Data-management buttons (sample data, import/export, wiping sign-off history) are all manager actions —
+    // hidden rather than just disabled, since a floor login has no reason to even know they exist.
+    ['btnSample', 'btnExportJson', 'btnImportJson', 'btnExportCsv', 'btnClearSignoff'].forEach(id => {
+      document.getElementById(id).style.display = isManager ? '' : 'none';
+    });
     if (role === 'floor'){
       // Only the "Job Cards" nav stays visible/reachable — everything else, including direct showPage() calls
       // from any leftover UI state, is simply never shown since only this one page's button remains.
@@ -3496,6 +3501,22 @@
     return eff.jobRecord ? eff.jobRecord.tasks.find(t => t.taskRefId === taskId) : null;
   }
 
+  // Every selected sub-task on a job-linked build, each paired with a display label for its owning task —
+  // used by the "Add work to this card" form's optional Sub-task picker. Narrows to one task's subtasks if
+  // taskId is given, otherwise lists across the whole job. Returns [] for a build with no job record.
+  function jobSubtasksForBuild(buildId, taskId){
+    const build = state.builds.find(b => b.id === buildId);
+    if (!build) return [];
+    const eff = effectiveBuildData(build);
+    if (!eff.jobRecord) return [];
+    const tasks = taskId ? eff.jobRecord.tasks.filter(t => t.taskRefId === taskId) : eff.jobRecord.tasks;
+    const result = [];
+    tasks.forEach(t => {
+      (t.subtasks || []).forEach(st => { if (st.selected) result.push({ subtask: st, taskId: t.taskRefId, taskName: jobTaskDisplayName(t) }); });
+    });
+    return result;
+  }
+
   // Real clocked hours for one Setup task on one build/date, pulled straight from Job Cards' timeLogs — this is
   // what the end-of-day sign-off prompt uses to pre-fill "Hours used" instead of just repeating the plan. Returns
   // null (not 0) when there's no job-card link or no logs that day at all, so the caller can fall back to plan.
@@ -4174,7 +4195,7 @@
     heading.textContent = 'Add work to this card';
     panel.appendChild(heading);
     const hint = document.createElement('div'); hint.className = 'hint';
-    hint.textContent = 'Any job — on today\'s schedule or not — with or without a specific task. Also use this to clock Lost Time or log Rework.';
+    hint.textContent = 'Any job — on today\'s schedule or not — with or without a specific task or sub-task. Nothing here is required. Pick a sub-task if you know it and hours count straight toward that job\'s real progress, even if it was never scheduled. Also use this to clock Lost Time or log Rework.';
     panel.appendChild(hint);
 
     const kindRow = document.createElement('div'); kindRow.className = 'field-row'; kindRow.style.marginTop = '8px';
@@ -4212,15 +4233,57 @@
     const taskLabel = document.createElement('label'); taskLabel.textContent = 'Task';
     taskRow.appendChild(taskLabel);
     const taskSel = document.createElement('select');
-    const noTaskOpt = document.createElement('option'); noTaskOpt.value = ''; noTaskOpt.textContent = '— No specific task —';
-    taskSel.appendChild(noTaskOpt);
-    state.tasks.forEach(t => {
-      const opt = document.createElement('option'); opt.value = t.id; opt.textContent = t.name;
-      if (t.id === defaults.taskId) opt.selected = true;
-      taskSel.appendChild(opt);
-    });
     taskRow.appendChild(taskSel);
     panel.appendChild(taskRow);
+
+    // Optional — only meaningful for a job-linked job. Picking one means the hours go straight onto that real
+    // sub-task's own timeLogs (feeding progress/reports exactly like a properly-scheduled card would), instead
+    // of a generic ad-hoc entry — handy for logging real work the manager just hasn't gotten around to
+    // scheduling yet.
+    const subtaskRow = document.createElement('div'); subtaskRow.className = 'field-row'; subtaskRow.style.marginTop = '6px';
+    const subtaskLabel = document.createElement('label'); subtaskLabel.textContent = 'Sub-task';
+    subtaskRow.appendChild(subtaskLabel);
+    const subtaskSel = document.createElement('select');
+    subtaskRow.appendChild(subtaskSel);
+    panel.appendChild(subtaskRow);
+
+    function refreshSubtaskOptions(){
+      const prev = subtaskSel.value;
+      subtaskSel.innerHTML = '';
+      const noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '— No specific sub-task —';
+      subtaskSel.appendChild(noneOpt);
+      const options = jobSel.value ? jobSubtasksForBuild(jobSel.value, taskSel.value || null) : [];
+      options.forEach(({ subtask, taskName }) => {
+        const opt = document.createElement('option'); opt.value = subtask.id;
+        opt.textContent = `${taskName} — ${subtask.name}`;
+        subtaskSel.appendChild(opt);
+      });
+      subtaskSel.disabled = options.length === 0;
+      if (options.some(o => o.subtask.id === prev)) subtaskSel.value = prev;
+    }
+
+    // Task narrows to only the tasks this job actually uses once a job is picked — no more choosing a task the
+    // job has nothing to do with. With no job picked (or a job that isn't linked to a real job record), falls
+    // back to every shop task, same as before.
+    function refreshTaskOptions(keepValue){
+      const prev = keepValue ? taskSel.value : (defaults.taskId || '');
+      taskSel.innerHTML = '';
+      const noTaskOpt = document.createElement('option'); noTaskOpt.value = ''; noTaskOpt.textContent = '— No specific task —';
+      taskSel.appendChild(noTaskOpt);
+      const build = jobSel.value ? state.builds.find(b => b.id === jobSel.value) : null;
+      const eff = build ? effectiveBuildData(build) : null;
+      const relevantIds = eff && eff.jobRecord ? Array.from(new Set(eff.jobRecord.tasks.map(t => t.taskRefId).filter(Boolean))) : null;
+      const tasksToShow = relevantIds ? state.tasks.filter(t => relevantIds.includes(t.id)) : state.tasks;
+      tasksToShow.forEach(t => {
+        const opt = document.createElement('option'); opt.value = t.id; opt.textContent = t.name;
+        taskSel.appendChild(opt);
+      });
+      taskSel.value = tasksToShow.some(t => t.id === prev) ? prev : '';
+      refreshSubtaskOptions();
+    }
+    jobSel.addEventListener('change', () => refreshTaskOptions(false));
+    taskSel.addEventListener('change', refreshSubtaskOptions);
+    refreshTaskOptions(false);
 
     const descRow = document.createElement('div'); descRow.className = 'field-row'; descRow.style.marginTop = '6px';
     const descLabel = document.createElement('label'); descLabel.textContent = 'Description';
@@ -4253,8 +4316,27 @@
     addBtn.textContent = '+ Add to this card';
     addBtn.addEventListener('click', () => {
       if (!descInp.value.trim() && !jobSel.value){ alert('Enter a description or pick a job first.'); return; }
+      const date = dateInp.value || jobCardsView.date;
+      if (subtaskSel.value){
+        // A specific sub-task is known — credit the hours straight onto its own timeLogs (real production
+        // work) instead of a generic ad-hoc entry, so it counts toward that job's progress/reports exactly
+        // like a properly-scheduled card would, even though nobody scheduled it. Type/Description are ignored
+        // here since they're for the ad-hoc path only — this is just real hours against a real sub-task.
+        let subtask = null;
+        jobSubtasksForBuild(jobSel.value, taskSel.value || null).forEach(o => { if (o.subtask.id === subtaskSel.value) subtask = o.subtask; });
+        if (!subtask){ alert('Could not find that sub-task — try reselecting Job/Task.'); return; }
+        const hours = Number(hoursInp.value) || 0;
+        const stopTime = nowTimeHHMM();
+        let startMin = timeToMinutes(stopTime) - Math.round(hours * 60);
+        if (startMin < 0) startMin += 24 * 60;
+        const startTime = String(Math.floor(startMin / 60)).padStart(2, '0') + ':' + String(startMin % 60).padStart(2, '0');
+        if (!Array.isArray(subtask.timeLogs)) subtask.timeLogs = [];
+        subtask.timeLogs.push({ id: uid('tl'), personId: person.id, date, startTime, stopTime });
+        save(); onAdd();
+        return;
+      }
       state.adHocCards.push({
-        id: uid('adhoc'), personId: person.id, date: dateInp.value || jobCardsView.date,
+        id: uid('adhoc'), personId: person.id, date,
         description: descInp.value.trim(), note: noteInp.value.trim(),
         buildId: jobSel.value || null, taskId: taskSel.value || null, kind: kindSel.value,
         jobNumber: '', hours: Number(hoursInp.value) || 0, completed: false, timeLogs: [], timerRunning: false
