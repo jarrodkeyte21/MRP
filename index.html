@@ -114,12 +114,18 @@
   .jobcard-field { display: flex; flex-direction: column; gap: 2px; }
   .jobcard-field-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-muted); }
 
+  .taskcard-head { display: flex; align-items: center; gap: 14px; }
+  .taskcard-jobnum { font-weight: 700; font-size: 16px; flex: 1; }
+  .taskcard-machine { font-size: 13px; color: var(--ink-muted); flex: 1; text-align: center; }
+  .taskcard-dealer { font-size: 13px; color: var(--ink-muted); flex: 1; text-align: right; }
+  .taskcard-taskname { font-size: 13px; color: var(--ink-muted); margin-top: 2px; }
+
   .subcard-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
   .subcard { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--surface-2); }
   .subcard-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
   .subcard-name { font-weight: 600; font-size: 14.5px; }
   .subcard-prefix { font-size: 11px; color: var(--ink-muted); margin-bottom: 1px; }
-  .subcard-meta { font-size: 12px; color: var(--ink-muted); white-space: nowrap; text-align: right; flex-shrink: 0; }
+  .subcard-meta { font-size: 16px; font-weight: 600; color: var(--ink); white-space: nowrap; text-align: right; flex-shrink: 0; }
   .subcard-notes { margin-top: 8px; }
   .subcard-notes input[type="text"] { width: 100%; }
   .subcard-note-text { font-size: 12px; color: var(--ink-muted); font-style: italic; }
@@ -4684,6 +4690,7 @@
 
       if (r.onDelete){
         const delBtn = document.createElement('button'); delBtn.className = 'btn-lg icon-only ghost'; delBtn.textContent = '✕';
+        delBtn.style.marginLeft = 'auto'; // pushed to the far right, away from the buttons tapped every day
         delBtn.title = 'Remove this — e.g. if it was added by mistake.';
         delBtn.addEventListener('click', () => {
           if (!confirm(`Remove "${r.name}"? This can't be undone.`)) return;
@@ -4891,13 +4898,20 @@
       const checklist = checklistForCard(jrTask, assignment, c.buildId, c.taskId, c.hours, pulled ? c.pulledFromDate : date);
 
       const cardPanel = document.createElement('div'); cardPanel.className = 'panel'; cardPanel.style.marginTop = '10px';
-      const titleRow = document.createElement('div'); titleRow.style.display = 'flex'; titleRow.style.alignItems = 'center'; titleRow.style.justifyContent = 'space-between'; titleRow.style.gap = '10px';
-      const titleH2 = document.createElement('h2'); titleH2.style.margin = '0';
-      titleH2.textContent = `${jobIdentityLabel(c.jobNumber, c.dealer, c.customer)} — ${c.taskName}${pulled ? ' (scheduled ' + fmtDateLong(c.pulledFromDate) + ')' : ''}`;
-      titleRow.appendChild(titleH2);
+
+      // Heading is three columns — job #, machine type, dealer/customer — rather than status/total-hours the
+      // employee doesn't need. Task name (what the sub-tasks below belong to) sits on its own line underneath.
+      const titleRow = document.createElement('div'); titleRow.className = 'taskcard-head';
+      const jobNumEl = document.createElement('div'); jobNumEl.className = 'taskcard-jobnum'; jobNumEl.textContent = c.jobNumber || '(no job #)';
+      titleRow.appendChild(jobNumEl);
+      const machineEl = document.createElement('div'); machineEl.className = 'taskcard-machine'; machineEl.textContent = c.machineType || '—';
+      titleRow.appendChild(machineEl);
+      const dealerEl = document.createElement('div'); dealerEl.className = 'taskcard-dealer';
+      dealerEl.textContent = [c.dealer, c.customer].filter(Boolean).join(' / ') || '—';
+      titleRow.appendChild(dealerEl);
       // Quick rework logging for a task already on the card — pre-fills the same job/task so the employee
       // doesn't have to re-pick them from the "Add work to this card" dropdowns below.
-      const reworkBtn = document.createElement('button'); reworkBtn.className = 'btn-lg ghost';
+      const reworkBtn = document.createElement('button'); reworkBtn.className = 'btn-lg ghost'; reworkBtn.style.flexShrink = '0';
       reworkBtn.textContent = '+ Rework';
       reworkBtn.title = 'Log rework hours against this same job/task.';
       reworkBtn.addEventListener('click', () => {
@@ -4911,13 +4925,9 @@
       });
       titleRow.appendChild(reworkBtn);
       cardPanel.appendChild(titleRow);
-      const header = document.createElement('div'); header.className = 'jobcard-header';
-      [['Machine type', c.machineType || '—'], ['Hours', String(c.hours)], ['Status', c.status || 'scheduled']].forEach(([l, v]) => {
-        const f = document.createElement('div'); f.className = 'jobcard-field';
-        f.innerHTML = `<span class="jobcard-field-label">${l}</span><span>${v}</span>`;
-        header.appendChild(f);
-      });
-      cardPanel.appendChild(header);
+      const taskNameEl = document.createElement('div'); taskNameEl.className = 'taskcard-taskname';
+      taskNameEl.textContent = c.taskName + (pulled ? ' (scheduled ' + fmtDateLong(c.pulledFromDate) + ')' : '');
+      cardPanel.appendChild(taskNameEl);
 
       if (checklist.length === 0){
         const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
