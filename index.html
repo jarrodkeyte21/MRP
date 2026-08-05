@@ -4933,7 +4933,10 @@
       // Sessions sits on its own in the middle — deliberately not next to Start/Stop, so reaching for it can't
       // accidentally hit (or be hit by) the Start/Stop tap.
       const sessionsExpanded = jobCardsLiveSessionsExpanded.has(obj.id);
-      const n = obj.timeLogs.length;
+      // Floor only ever sees today's own sessions, not the task's whole history — the count badge matches
+      // whatever renderSessionLog will actually show them.
+      const isFloorForSessions = currentProfile && currentProfile.role === 'floor';
+      const n = isFloorForSessions ? obj.timeLogs.filter(tl => tl.date === date).length : obj.timeLogs.length;
       const sessionsBtn = document.createElement('button'); sessionsBtn.className = 'ghost';
       sessionsBtn.textContent = `${n} session${n === 1 ? '' : 's'} ${sessionsExpanded ? '▾' : '▸'}`;
       sessionsBtn.addEventListener('click', () => {
@@ -4983,7 +4986,11 @@
   // to add one purely by hand for a session the timer button was never used for at all.
   function renderSessionLog(obj, defaultPerson, defaultDate){
     const wrap = document.createElement('div');
-    if (obj.timeLogs.length === 0){
+    // Floor only ever sees today's own sessions on a task — not its whole history across every day it's ever
+    // been worked (which may well include other people's time). Managers still see everything.
+    const isFloor = currentProfile && currentProfile.role === 'floor';
+    const visibleLogs = isFloor ? obj.timeLogs.filter(tl => tl.date === defaultDate) : obj.timeLogs;
+    if (visibleLogs.length === 0){
       const empty = document.createElement('div'); empty.className = 'dep-empty';
       empty.textContent = 'No sessions logged yet.';
       wrap.appendChild(empty);
@@ -4991,7 +4998,7 @@
       const table = document.createElement('table'); table.className = 'editor';
       table.innerHTML = '<thead><tr><th style="width:120px">Date</th><th>Who</th><th style="width:100px">Start</th><th style="width:100px">Stop</th><th style="width:60px">Hours</th><th></th></tr></thead>';
       const tbody = document.createElement('tbody');
-      obj.timeLogs.forEach(tl => {
+      visibleLogs.forEach(tl => {
         const tr = document.createElement('tr');
         const tdDate = document.createElement('td');
         const dateInp = document.createElement('input'); dateInp.type = 'date'; dateInp.value = tl.date || '';
@@ -5000,7 +5007,6 @@
 
         const tdWho = document.createElement('td');
         // Reassigning a session to someone else is a manager-only move — floor logins just see who it's under.
-        const isFloor = currentProfile && currentProfile.role === 'floor';
         if (isFloor){
           const who = tl.personId ? state.people.find(p => p.id === tl.personId) : null;
           tdWho.textContent = who ? (who.name || '(unnamed)') : '(unassigned)';
