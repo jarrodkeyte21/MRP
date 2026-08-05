@@ -6054,15 +6054,16 @@
     // Overall stat cards
     const totals = breakdowns.reduce((acc, b) => {
       acc.revenue += b.sellPrice; acc.cogs += b.totals.costOfGoods; acc.labour += b.totals.actualLabourCost;
-      acc.gross += b.grossProfit; acc.net += b.netProfit;
+      acc.gross += b.grossProfit; acc.net += b.netProfit; acc.plannedNet += b.plannedNetProfit;
       return acc;
-    }, { revenue: 0, cogs: 0, labour: 0, gross: 0, net: 0 });
+    }, { revenue: 0, cogs: 0, labour: 0, gross: 0, net: 0, plannedNet: 0 });
     const statGrid = document.createElement('div'); statGrid.className = 'jobcard-header'; statGrid.style.marginTop = '10px';
     [
       ['Total revenue', fmtMoney(totals.revenue)],
       ['Total cost (goods + labour)', fmtMoney(totals.cogs + totals.labour)],
       ['Total gross profit', fmtMoney(totals.gross)],
-      ['Total net profit', fmtMoney(totals.net)]
+      ['Total net profit (planned)', fmtMoney(totals.plannedNet)],
+      ['Total net profit (actual)', fmtMoney(totals.net)]
     ].forEach(([l, v]) => {
       const f = document.createElement('div'); f.className = 'jobcard-field';
       f.innerHTML = `<span class="jobcard-field-label">${l}</span><span style="font-size:16px;font-weight:700">${v}</span>`;
@@ -6070,9 +6071,21 @@
     });
     section.appendChild(statGrid);
 
+    // Net profit: planned vs actual, per job — the comparison that actually shows whether a job ran to budget.
+    const netTitle = document.createElement('div'); netTitle.style.marginTop = '18px'; netTitle.style.fontWeight = '700';
+    netTitle.textContent = 'Net profit: planned vs actual, per job';
+    section.appendChild(netTitle);
+    const maxAbsNet = Math.max(1, ...breakdowns.flatMap(b => [Math.abs(b.plannedNetProfit), Math.abs(b.netProfit)]));
+    const netWrap = document.createElement('div'); netWrap.style.marginTop = '8px';
+    breakdowns.forEach(b => {
+      renderProfitBar(netWrap, b.jobLabel + ' (planned)', b.plannedNetProfit, maxAbsNet);
+      renderProfitBar(netWrap, b.jobLabel + ' (actual)', b.netProfit, maxAbsNet);
+    });
+    section.appendChild(netWrap);
+
     // Per-job chart
     const perJobTitle = document.createElement('div'); perJobTitle.style.marginTop = '18px'; perJobTitle.style.fontWeight = '700';
-    perJobTitle.textContent = 'Gross vs net profit per job';
+    perJobTitle.textContent = 'Gross vs net profit per job (actual)';
     section.appendChild(perJobTitle);
     const maxAbsJob = Math.max(1, ...breakdowns.flatMap(b => [Math.abs(b.grossProfit), Math.abs(b.netProfit)]));
     const perJobWrap = document.createElement('div'); perJobWrap.style.marginTop = '8px';
@@ -6086,18 +6099,19 @@
     const byMachine = new Map();
     breakdowns.forEach(b => {
       const key = b.machineType || '—';
-      if (!byMachine.has(key)) byMachine.set(key, { gross: 0, net: 0, count: 0 });
+      if (!byMachine.has(key)) byMachine.set(key, { gross: 0, net: 0, plannedNet: 0, count: 0 });
       const g = byMachine.get(key);
-      g.gross += b.grossProfit; g.net += b.netProfit; g.count += 1;
+      g.gross += b.grossProfit; g.net += b.netProfit; g.plannedNet += b.plannedNetProfit; g.count += 1;
     });
     const machineTitle = document.createElement('div'); machineTitle.style.marginTop = '18px'; machineTitle.style.fontWeight = '700';
     machineTitle.textContent = 'Grouped by machine type';
     section.appendChild(machineTitle);
-    const maxAbsMachine = Math.max(1, ...[...byMachine.values()].flatMap(v => [Math.abs(v.gross), Math.abs(v.net)]));
+    const maxAbsMachine = Math.max(1, ...[...byMachine.values()].flatMap(v => [Math.abs(v.gross), Math.abs(v.net), Math.abs(v.plannedNet)]));
     const machineWrap = document.createElement('div'); machineWrap.style.marginTop = '8px';
     [...byMachine.entries()].sort((a, b) => b[1].net - a[1].net).forEach(([machineType, v]) => {
       renderProfitBar(machineWrap, `${machineType} — gross (${v.count} job${v.count === 1 ? '' : 's'})`, v.gross, maxAbsMachine);
-      renderProfitBar(machineWrap, `${machineType} — net`, v.net, maxAbsMachine);
+      renderProfitBar(machineWrap, `${machineType} — net (planned)`, v.plannedNet, maxAbsMachine);
+      renderProfitBar(machineWrap, `${machineType} — net (actual)`, v.net, maxAbsMachine);
     });
     section.appendChild(machineWrap);
   }
@@ -6187,10 +6201,11 @@
         [
           ['Sell price', fmtMoney(b.sellPrice)],
           ['Cost of goods', fmtMoney(b.totals.costOfGoods)],
+          ['Labour cost (planned)', fmtMoney(b.totals.plannedLabourCost)],
           ['Labour cost (actual)', fmtMoney(b.totals.actualLabourCost)],
           ['Gross profit', fmtMoney(b.grossProfit)],
-          ['Net profit', fmtMoney(b.netProfit)],
-          ['Net profit (if on budget hours)', fmtMoney(b.plannedNetProfit)]
+          ['Net profit (planned)', fmtMoney(b.plannedNetProfit)],
+          ['Net profit (actual)', fmtMoney(b.netProfit)]
         ].forEach(([l, v]) => {
           const f = document.createElement('div'); f.className = 'jobcard-field';
           f.innerHTML = `<span class="jobcard-field-label">${l}</span><span>${v}</span>`;
