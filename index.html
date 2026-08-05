@@ -404,6 +404,8 @@
 <div id="page-schedule">
   <section class="row-gap" id="resultsSection"></section>
 
+  <section class="panel row-gap" id="moveBuildPreviewSection"></section>
+
   <section class="panel row-gap">
     <h2>Builds</h2>
     <div class="hint">Drag the ⠿ handle to reorder — top gets pool hours first each day. Use the small dropdown under Machine type to apply a template. Order date ("auto", dashed) keeps itself updated to when the shop could actually start the job — type a date to pin it as a fixed constraint, or click "↺ Auto" to go back to auto-updating. Lead (days) and hours per task follow the linked template by default — type a value to override just that job (shown in red); click into an overridden number and press R to reset it back to the template value. A notes box appears under a job's hours whenever it has an override, to record why. Track each job's real-world stage using the Status dropdown in Build summary below — moving it past "Scheduled" turns its ORDERED block on the schedule from grey to confirmed.</div>
@@ -1663,7 +1665,11 @@
   }
 
   // ---------- scheduling engine. Pass a build id via ignoreHoldFor to compute what-if: that one build scheduled as if it had no order/lead-time hold (used to suggest an order date), while every other build's hold and pool contention still applies. ----------
-  function runSchedule(ignoreHoldFor){
+  // `overtimeBuildId`, when given, lets that one build's allocations ignore the pool's remaining budget for the
+  // day (ts.remaining/its own people-cap still apply) instead of being blocked once the pool runs dry — used by
+  // the "preview a move" panel to simulate "push this job through even if it means overtime" without touching
+  // the real schedule. Leaving it undefined reproduces the exact prior behaviour (hard capacity gate for everyone).
+  function runSchedule(ignoreHoldFor, overtimeBuildId){
     const pools = state.pools;
     const tasks = state.tasks;
     const poolById = Object.fromEntries(pools.map(p=>[p.id,p]));
@@ -1787,14 +1793,20 @@
         // anything was allocated.
         function tryAllocate(b, task, pool, viaSecondary){
           if (!pool) return false;
-          if (poolRemaining[pool.id] <= 0) return false;
+          const isOvertimeBuild = overtimeBuildId && b.id === overtimeBuildId;
+          if (!isOvertimeBuild && poolRemaining[pool.id] <= 0) return false;
           if (!isReady(b, task)) return false;
           const deps = b.dependsOn[task.id] || [];
           if (deps.some(depId => b.tasksWorkedToday.has(depId))) return false;
           const ts = b.tstates.find(x => x.taskId === task.id);
           const taskHoursCapToday = ts.capPeople != null ? ts.capPeople * poolShiftHoursOn(pool, todayISO) : null;
           const capRemaining = taskHoursCapToday != null ? Math.max(0, taskHoursCapToday - ts.allocatedToday) : Infinity;
-          const alloc = Math.min(poolRemaining[pool.id], ts.remaining, capRemaining);
+          // The overtime build ignores what's left in the pool's normal daily budget (poolRemaining can go
+          // negative for it — that negative amount is exactly the overtime hours the preview panel reports),
+          // but it still can't exceed its own remaining work or its own per-task people cap.
+          const alloc = isOvertimeBuild
+            ? Math.min(ts.remaining, capRemaining)
+            : Math.min(poolRemaining[pool.id], ts.remaining, capRemaining);
           if (alloc <= 0) return false;
           if (!b.startDate) b.startDate = toISO(current);
           // Top up an existing same-day record for this task instead of pushing a second one — e.g. a partial,
@@ -2935,6 +2947,8 @@
     if (historyPage && historyPage.style.display !== 'none') renderJobHistory();
     const stockPage = document.getElementById('page-stock');
     if (stockPage && stockPage.style.display !== 'none') renderStock();
+
+    renderMoveBuildPreviewPanel();
   }
 
   // ---------- render: job history — every build that has ever existed, active or removed from Build summary,
@@ -3266,6 +3280,228 @@
   // The oldest date still shown live — anything older belongs in the Archive tab.
   function jobCardsArchiveCutoff(){
     return toISO(addDays(parseISO(getTodayISO()), -2));
+  }
+
+  // ---------- "Preview a move": temporarily reorder state.builds, run the real scheduler against that
+  // hypothetical order, and diff the result against the current schedule — all synchronously, so nothing else
+  // ever observes the reordered array. Nothing here is persisted until the manager explicitly applies it. ----------
+
+  // Runs fn() with state.builds temporarily reordered to newOrderIds, then restores the exact original array
+  // (even if fn throws). Any build not named in newOrderIds keeps its relative position at the end, so a caller
+  // only has to specify the builds it actually cares about moving.
+  function withBuildOrder(newOrderIds, fn){
+    const original = state.builds;
+    const byId = new Map(original.map(b => [b.id, b]));
+    const reordered = newOrderIds.map(id => byId.get(id)).filter(Boolean);
+    const placed = new Set(reordered.map(b => b.id));
+    original.forEach(b => { if (!placed.has(b.id)) reordered.push(b); });
+    state.builds = reordered;
+    try { return fn(); }
+    finally { state.builds = original; }
+  }
+
+  // A snapshot of what matters for comparison: every build's start/finish date, and any day/pool where usage
+  // came out above that day's actual capacity (only possible when overtimeBuildId let a build ignore the cap).
+  function scheduleSnapshot(overtimeBuildId){
+    const { builds, dailyPoolUsage } = runSchedule(undefined, overtimeBuildId);
+    const perBuild = {};
+    builds.forEach(b => { perBuild[b.id] = { startDate: b.startDate, finishDate: b.finishDate }; });
+    const poolOverage = [];
+    dailyPoolUsage.forEach(({ date, usage }) => {
+      state.pools.forEach(p => {
+        const cap = poolHoursOn(p, date);
+        const used = usage[p.id] || 0;
+        if (used > cap + 0.001) poolOverage.push({ date, poolId: p.id, poolName: p.name, capacity: cap, used, overHours: used - cap });
+      });
+    });
+    return { perBuild, poolOverage };
+  }
+
+  // Preview moving `buildId` to sit directly before `beforeBuildId` (or to the very top if beforeBuildId is
+  // null) in schedule priority. Returns which other builds' finish dates would shift and by how many days, plus
+  // any pool overage the move would need if allowOverCapacity let it jump the capacity queue. Nothing is
+  // persisted — callers only get to see the effect until they explicitly apply it via applyBuildMove().
+  function previewBuildMove(buildId, beforeBuildId, allowOverCapacity){
+    const moving = state.builds.find(b => b.id === buildId);
+    if (!moving) return null;
+    const baseline = scheduleSnapshot(null);
+    const newOrderIds = state.builds.map(b => b.id).filter(id => id !== buildId);
+    const insertAt = beforeBuildId ? newOrderIds.indexOf(beforeBuildId) : 0;
+    newOrderIds.splice(insertAt < 0 ? 0 : insertAt, 0, buildId);
+    const hypothetical = withBuildOrder(newOrderIds, () => scheduleSnapshot(allowOverCapacity ? buildId : null));
+    const changes = [];
+    state.builds.forEach(b => {
+      if (b.id === buildId || b.archived || b.status === 'complete') return;
+      const before = baseline.perBuild[b.id];
+      const after = hypothetical.perBuild[b.id];
+      if (!before || !after) return;
+      if (before.finishDate !== after.finishDate){
+        changes.push({ buildId: b.id, beforeFinish: before.finishDate, afterFinish: after.finishDate });
+      }
+    });
+    const movedBefore = baseline.perBuild[buildId];
+    const movedAfter = hypothetical.perBuild[buildId];
+    return {
+      newOrderIds,
+      moved: { buildId, beforeFinish: movedBefore ? movedBefore.finishDate : null, afterFinish: movedAfter ? movedAfter.finishDate : null },
+      changes,
+      poolOverage: hypothetical.poolOverage
+    };
+  }
+
+  // Actually commits a previously-previewed move — reorders state.builds for real and saves. Takes the exact
+  // newOrderIds a preview returned, so what gets applied is guaranteed to match what the manager just reviewed.
+  function applyBuildMove(newOrderIds){
+    const byId = new Map(state.builds.map(b => [b.id, b]));
+    const reordered = newOrderIds.map(id => byId.get(id)).filter(Boolean);
+    const placed = new Set(reordered.map(b => b.id));
+    state.builds.forEach(b => { if (!placed.has(b.id)) reordered.push(b); });
+    state.builds = reordered;
+    save();
+  }
+
+  let moveBuildPreviewState = { buildId: '', beforeBuildId: '', allowOverCapacity: false, result: null };
+
+  function renderMoveBuildPreviewPanel(){
+    const section = document.getElementById('moveBuildPreviewSection');
+    if (!section) return;
+    section.innerHTML = '';
+
+    const eligible = state.builds.filter(b => !b.archived && b.status !== 'complete');
+    section.innerHTML = '<h2>Preview a move</h2><div class="hint">Move a job ahead of others and see what it does to everyone else\'s finish date and pool hours — before anything actually changes.</div>';
+    if (eligible.length < 2){
+      const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
+      empty.textContent = 'Need at least two active jobs to preview a move.';
+      section.appendChild(empty);
+      return;
+    }
+
+    // Selection resets to something valid if the build it was pointed at got archived/completed/removed since.
+    if (moveBuildPreviewState.buildId && !eligible.some(b => b.id === moveBuildPreviewState.buildId)){
+      moveBuildPreviewState = { buildId: '', beforeBuildId: '', allowOverCapacity: false, result: null };
+    }
+
+    const labelFor = (b) => { const eff = effectiveBuildData(b); return jobIdentityLabel(eff.jobNumber, eff.dealer, eff.customer); };
+
+    const row = document.createElement('div'); row.className = 'field-row'; row.style.marginTop = '10px';
+
+    const moveLabel = document.createElement('label'); moveLabel.textContent = 'Move';
+    row.appendChild(moveLabel);
+
+    const buildSel = document.createElement('select');
+    const noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '— Pick a job —';
+    buildSel.appendChild(noneOpt);
+    eligible.forEach(b => {
+      const opt = document.createElement('option'); opt.value = b.id; opt.textContent = labelFor(b);
+      if (moveBuildPreviewState.buildId === b.id) opt.selected = true;
+      buildSel.appendChild(opt);
+    });
+    buildSel.addEventListener('change', () => {
+      moveBuildPreviewState = { buildId: buildSel.value, beforeBuildId: '', allowOverCapacity: false, result: null };
+      renderMoveBuildPreviewPanel();
+    });
+    row.appendChild(buildSel);
+
+    const beforeLabel = document.createElement('label'); beforeLabel.textContent = 'to before';
+    row.appendChild(beforeLabel);
+
+    const beforeSel = document.createElement('select');
+    beforeSel.disabled = !moveBuildPreviewState.buildId;
+    const topOpt = document.createElement('option'); topOpt.value = ''; topOpt.textContent = '— Top of the queue —';
+    beforeSel.appendChild(topOpt);
+    eligible.filter(b => b.id !== moveBuildPreviewState.buildId).forEach(b => {
+      const opt = document.createElement('option'); opt.value = b.id; opt.textContent = labelFor(b);
+      if (moveBuildPreviewState.beforeBuildId === b.id) opt.selected = true;
+      beforeSel.appendChild(opt);
+    });
+    beforeSel.addEventListener('change', () => {
+      moveBuildPreviewState.beforeBuildId = beforeSel.value;
+      moveBuildPreviewState.result = null;
+      renderMoveBuildPreviewPanel();
+    });
+    row.appendChild(beforeSel);
+    section.appendChild(row);
+
+    const overtimeRow = document.createElement('div'); overtimeRow.className = 'field-row';
+    const overtimeLabel = document.createElement('label');
+    overtimeLabel.style.minWidth = 'unset';
+    const overtimeCb = document.createElement('input'); overtimeCb.type = 'checkbox'; overtimeCb.checked = moveBuildPreviewState.allowOverCapacity;
+    overtimeCb.disabled = !moveBuildPreviewState.buildId;
+    overtimeCb.addEventListener('change', () => {
+      moveBuildPreviewState.allowOverCapacity = overtimeCb.checked;
+      moveBuildPreviewState.result = null;
+      renderMoveBuildPreviewPanel();
+    });
+    overtimeLabel.appendChild(overtimeCb);
+    overtimeLabel.append(' Let this job jump ahead even if it means going over capacity, instead of delaying other jobs');
+    overtimeRow.appendChild(overtimeLabel);
+    section.appendChild(overtimeRow);
+
+    const previewBtn = document.createElement('button'); previewBtn.className = 'primary'; previewBtn.style.marginTop = '10px';
+    previewBtn.textContent = 'Preview effect';
+    previewBtn.disabled = !moveBuildPreviewState.buildId;
+    previewBtn.addEventListener('click', () => {
+      moveBuildPreviewState.result = previewBuildMove(moveBuildPreviewState.buildId, moveBuildPreviewState.beforeBuildId || null, moveBuildPreviewState.allowOverCapacity);
+      renderMoveBuildPreviewPanel();
+    });
+    section.appendChild(previewBtn);
+
+    const result = moveBuildPreviewState.result;
+    if (!result) return;
+
+    const resultWrap = document.createElement('div'); resultWrap.style.marginTop = '16px'; resultWrap.style.paddingTop = '12px'; resultWrap.style.borderTop = '1px dashed var(--line)';
+
+    const movedBuild = state.builds.find(b => b.id === result.moved.buildId);
+    const movedLine = document.createElement('div'); movedLine.style.marginBottom = '8px';
+    movedLine.innerHTML = `<strong>${movedBuild ? labelFor(movedBuild) : 'This job'}</strong> — finish ${result.moved.beforeFinish ? fmtShort(parseISO(result.moved.beforeFinish)) : 'unscheduled'} → `
+      + `<span style="color:var(--accent);font-weight:700">${result.moved.afterFinish ? fmtShort(parseISO(result.moved.afterFinish)) : 'unscheduled'}</span>`;
+    resultWrap.appendChild(movedLine);
+
+    if (result.changes.length === 0){
+      const noneLine = document.createElement('div'); noneLine.className = 'dep-empty';
+      noneLine.textContent = 'No other job\'s finish date would change.';
+      resultWrap.appendChild(noneLine);
+    } else {
+      const changesTitle = document.createElement('div'); changesTitle.className = 'hint'; changesTitle.style.marginBottom = '4px';
+      changesTitle.textContent = 'Other jobs affected:';
+      resultWrap.appendChild(changesTitle);
+      result.changes.forEach(c => {
+        const b = state.builds.find(x => x.id === c.buildId);
+        if (!b) return;
+        const delayed = !c.beforeFinish || (c.afterFinish && c.afterFinish > c.beforeFinish);
+        const line = document.createElement('div'); line.style.marginBottom = '4px';
+        line.innerHTML = `${labelFor(b)} — finish ${c.beforeFinish ? fmtShort(parseISO(c.beforeFinish)) : 'unscheduled'} → `
+          + `<span style="color:${delayed ? 'var(--critical)' : 'var(--good)'};font-weight:700">${c.afterFinish ? fmtShort(parseISO(c.afterFinish)) : 'unscheduled'}</span>`;
+        resultWrap.appendChild(line);
+      });
+    }
+
+    if (result.poolOverage.length){
+      const overageTitle = document.createElement('div'); overageTitle.style.marginTop = '10px'; overageTitle.style.color = 'var(--critical)'; overageTitle.style.fontWeight = '700';
+      overageTitle.textContent = 'Needs overtime to avoid delaying other jobs:';
+      resultWrap.appendChild(overageTitle);
+      result.poolOverage.forEach(o => {
+        const line = document.createElement('div'); line.style.color = 'var(--critical)';
+        line.textContent = `${o.poolName} — ${Math.round(o.overHours * 100) / 100}h over on ${fmtShort(parseISO(o.date))}`;
+        resultWrap.appendChild(line);
+      });
+    }
+
+    const actionRow = document.createElement('div'); actionRow.style.marginTop = '12px'; actionRow.style.display = 'flex'; actionRow.style.gap = '8px';
+    const applyBtn = document.createElement('button'); applyBtn.className = 'primary'; applyBtn.textContent = 'Apply this move';
+    applyBtn.addEventListener('click', () => {
+      if (!confirm(`Move ${movedBuild ? labelFor(movedBuild) : 'this job'} ahead as previewed? This changes the real schedule.`)) return;
+      applyBuildMove(result.newOrderIds);
+      moveBuildPreviewState = { buildId: '', beforeBuildId: '', allowOverCapacity: false, result: null };
+      renderBuildTable(); renderResults();
+    });
+    actionRow.appendChild(applyBtn);
+    const cancelBtn = document.createElement('button'); cancelBtn.className = 'ghost'; cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', () => { moveBuildPreviewState.result = null; renderMoveBuildPreviewPanel(); });
+    actionRow.appendChild(cancelBtn);
+    resultWrap.appendChild(actionRow);
+
+    section.appendChild(resultWrap);
   }
 
   // One runSchedule() pass, grouped by date so any number of dates can be looked up cheaply afterwards
