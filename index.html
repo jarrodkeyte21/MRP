@@ -398,6 +398,7 @@
   <button data-page="jobcardslive" id="navJobCardsLive">Job Cards</button>
   <button data-page="archive" id="navArchive">Archive</button>
   <button data-page="reports" id="navReports">Reports</button>
+  <button data-page="financial" id="navFinancial">Financial Reports</button>
   <button data-page="logins" id="navLogins" style="display:none">Logins</button>
 </nav>
 
@@ -478,6 +479,12 @@
 
 <div id="page-reports" style="display:none">
   <section class="row-gap" id="reportsSection"></section>
+</div>
+
+<div id="page-financial" style="display:none">
+  <section class="panel row-gap" id="financialGenerateSection"></section>
+  <section class="panel row-gap" id="financialOverviewSection"></section>
+  <section class="panel row-gap" id="financialReportsListSection"></section>
 </div>
 
 <div id="page-signoff" style="display:none">
@@ -1130,6 +1137,12 @@
   function normalizeState(){
     if (!state.actuals) state.actuals = {};
     if (!state.dayFinished) state.dayFinished = {};
+    if (!state.financialReports) state.financialReports = [];
+    state.financialReports.forEach(r => {
+      if (!r.costOfGoodsByTask) r.costOfGoodsByTask = {};
+      if (r.hourlyRate === undefined) r.hourlyRate = 0;
+      if (r.sellPrice === undefined) r.sellPrice = 0;
+    });
     if (state.meta.lastCheckedDate === undefined) state.meta.lastCheckedDate = null;
     // Sign-off is just a correction layered on top of the simulation now (see runSchedule), not a gate on the
     // start date — so the start date always rolls forward to today, every load, regardless of sign-off history.
@@ -1482,6 +1495,77 @@
       Object.values(buildActuals).forEach(rec => { sum += Number(rec.hours) || 0; });
     });
     return sum;
+  }
+
+  // Same signed-off "actual" hours as actualHoursUsedForBuild, but kept broken out per task — the Financial
+  // Reports tab needs to compare planned vs actual hours one shop task at a time, not just a single build total.
+  function actualHoursByTaskForBuild(buildId){
+    const out = {};
+    Object.values(state.actuals || {}).forEach(dayActuals => {
+      const buildActuals = dayActuals[buildId];
+      if (!buildActuals) return;
+      Object.keys(buildActuals).forEach(taskId => {
+        out[taskId] = (out[taskId] || 0) + (Number(buildActuals[taskId].hours) || 0);
+      });
+    });
+    return out;
+  }
+
+  // ---------- Financial Reports: cost of goods (materials, entered per task) and hours (planned from the
+  // schedule, actual from signed-off history) combined with a labour rate and sell price into a profit
+  // breakdown. Hours are always computed live off current state rather than frozen at report-creation time, so
+  // an in-progress job's report keeps reflecting real progress; the dollar inputs (rate/COGS/sell price) are the
+  // only things actually stored on the report, and stay editable afterwards to correct a typo. Gross profit is
+  // revenue minus materials only; net profit also deducts labour — that split is what lets a manager see
+  // "we're fine on materials but labour's eating the job" at a glance instead of one blended number. ----------
+  function financialReportBreakdown(report){
+    const build = state.builds.find(b => b.id === report.buildId);
+    const eff = build ? effectiveBuildData(build) : null;
+    const plannedByTask = eff ? eff.hours : {};
+    const actualByTask = build ? actualHoursByTaskForBuild(build.id) : {};
+    const cogsByTask = report.costOfGoodsByTask || {};
+
+    const taskIds = new Set([
+      ...Object.keys(plannedByTask).filter(id => (Number(plannedByTask[id]) || 0) > 0),
+      ...Object.keys(actualByTask).filter(id => (Number(actualByTask[id]) || 0) > 0),
+      ...Object.keys(cogsByTask).filter(id => (Number(cogsByTask[id]) || 0) > 0)
+    ]);
+
+    const hourlyRate = Number(report.hourlyRate) || 0;
+    const sellPrice = Number(report.sellPrice) || 0;
+
+    const tasks = state.tasks.filter(t => taskIds.has(t.id)).map(t => {
+      const plannedHours = Number(plannedByTask[t.id]) || 0;
+      const actualHours = Number(actualByTask[t.id]) || 0;
+      const costOfGoods = Number(cogsByTask[t.id]) || 0;
+      return {
+        taskId: t.id, taskName: t.name,
+        plannedHours, actualHours, hoursVariance: actualHours - plannedHours,
+        plannedLabourCost: plannedHours * hourlyRate, actualLabourCost: actualHours * hourlyRate,
+        costOfGoods
+      };
+    }).sort((a, b) => a.taskName.localeCompare(b.taskName));
+
+    const totals = tasks.reduce((acc, t) => {
+      acc.plannedHours += t.plannedHours; acc.actualHours += t.actualHours;
+      acc.plannedLabourCost += t.plannedLabourCost; acc.actualLabourCost += t.actualLabourCost;
+      acc.costOfGoods += t.costOfGoods;
+      return acc;
+    }, { plannedHours: 0, actualHours: 0, plannedLabourCost: 0, actualLabourCost: 0, costOfGoods: 0 });
+
+    const grossProfit = sellPrice - totals.costOfGoods;
+    const netProfit = grossProfit - totals.actualLabourCost;
+    const plannedNetProfit = grossProfit - totals.plannedLabourCost;
+
+    return {
+      build, eff,
+      jobLabel: jobIdentityLabel(report.jobNumber, report.dealer, report.customer),
+      machineType: report.machineType || (eff ? eff.machineType : '') || '—',
+      tasks, totals, sellPrice, hourlyRate,
+      grossProfit, netProfit, plannedNetProfit,
+      grossMarginPct: sellPrice ? (grossProfit / sellPrice) * 100 : null,
+      netMarginPct: sellPrice ? (netProfit / sellPrice) * 100 : null
+    };
   }
 
   // ---------- hours ticked off a build's real sub-task checklist (shop floor "Mark complete"), regardless of
@@ -5810,6 +5894,326 @@
     renderReportsPage();
   }
 
+  // ---------- Financial Reports: manager-only (hidden from floor the same way Schedule/Reports/Logins already
+  // are — see applyRoleUI's blanket nav-hiding for the floor role). Generate a report against a scheduled job,
+  // enter its dollar figures, and it's saved here for as long as it's wanted — see financialReportBreakdown for
+  // how the numbers themselves are worked out. ----------
+  function fmtMoney(n){
+    const v = Math.round((Number(n) || 0) * 100) / 100;
+    return '$' + v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  let financialDraftState = null; // { buildId, hourlyRate, sellPrice, costOfGoodsByTask } while generating a new report
+  let financialReportsExpanded = new Set();
+
+  function renderFinancialPage(){
+    renderFinancialGeneratePanel();
+    renderFinancialOverviewSection();
+    renderFinancialReportsListSection();
+  }
+
+  function renderFinancialGeneratePanel(){
+    const section = document.getElementById('financialGenerateSection');
+    if (!section) return;
+    section.innerHTML = '<h2>Generate a report</h2><div class="hint">Pick a scheduled job, enter its numbers, and it\'s saved below for as long as you want it — hours stay live off the schedule, so an in-progress job\'s report keeps catching up as work happens.</div>';
+
+    const eligibleBuilds = state.builds.filter(b => !b.archived);
+
+    if (!financialDraftState){
+      if (eligibleBuilds.length === 0){
+        const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
+        empty.textContent = 'No scheduled jobs to report on yet.';
+        section.appendChild(empty);
+        return;
+      }
+      const row = document.createElement('div'); row.className = 'field-row'; row.style.marginTop = '10px';
+      const label = document.createElement('label'); label.textContent = 'Job';
+      row.appendChild(label);
+      const sel = document.createElement('select');
+      const noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '— Pick a job —';
+      sel.appendChild(noneOpt);
+      eligibleBuilds.forEach(b => {
+        const eff = effectiveBuildData(b);
+        const opt = document.createElement('option'); opt.value = b.id; opt.textContent = jobIdentityLabel(eff.jobNumber, eff.dealer, eff.customer) + (eff.machineType ? ' — ' + eff.machineType : '');
+        sel.appendChild(opt);
+      });
+      row.appendChild(sel);
+      const startBtn = document.createElement('button'); startBtn.className = 'primary';
+      startBtn.textContent = 'Generate report';
+      startBtn.addEventListener('click', () => {
+        if (!sel.value){ alert('Pick a job first.'); return; }
+        financialDraftState = { buildId: sel.value, hourlyRate: 0, sellPrice: 0, costOfGoodsByTask: {} };
+        renderFinancialGeneratePanel();
+      });
+      row.appendChild(startBtn);
+      section.appendChild(row);
+      return;
+    }
+
+    // Draft in progress — collect rate/sell price/cost-of-goods-per-task before it's actually saved as a report.
+    const build = state.builds.find(b => b.id === financialDraftState.buildId);
+    if (!build){
+      financialDraftState = null;
+      renderFinancialGeneratePanel();
+      return;
+    }
+    const eff = effectiveBuildData(build);
+    const relevantTasks = state.tasks.filter(t => (Number(eff.hours[t.id]) || 0) > 0);
+
+    const titleRow = document.createElement('div'); titleRow.style.marginTop = '10px'; titleRow.style.fontWeight = '700';
+    titleRow.textContent = jobIdentityLabel(eff.jobNumber, eff.dealer, eff.customer) + (eff.machineType ? ' — ' + eff.machineType : '');
+    section.appendChild(titleRow);
+
+    const rateRow = document.createElement('div'); rateRow.className = 'field-row'; rateRow.style.marginTop = '10px';
+    const rateLabel = document.createElement('label'); rateLabel.textContent = 'Hourly rate ($)';
+    rateRow.appendChild(rateLabel);
+    const rateInp = document.createElement('input'); rateInp.type = 'number'; rateInp.min = '0'; rateInp.step = '0.01'; rateInp.style.width = '90px';
+    rateInp.value = financialDraftState.hourlyRate || '';
+    rateInp.addEventListener('input', () => { financialDraftState.hourlyRate = Number(rateInp.value) || 0; });
+    rateRow.appendChild(rateInp);
+    const sellLabel = document.createElement('label'); sellLabel.textContent = 'Sell price ($)';
+    rateRow.appendChild(sellLabel);
+    const sellInp = document.createElement('input'); sellInp.type = 'number'; sellInp.min = '0'; sellInp.step = '0.01'; sellInp.style.width = '110px';
+    sellInp.value = financialDraftState.sellPrice || '';
+    sellInp.addEventListener('input', () => { financialDraftState.sellPrice = Number(sellInp.value) || 0; });
+    rateRow.appendChild(sellInp);
+    section.appendChild(rateRow);
+
+    if (relevantTasks.length === 0){
+      const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
+      empty.textContent = 'This job has no hours allocated to any task yet — cost of goods can still be entered once it does.';
+      section.appendChild(empty);
+    } else {
+      const cogsTitle = document.createElement('div'); cogsTitle.className = 'hint'; cogsTitle.style.marginTop = '10px'; cogsTitle.style.marginBottom = '4px';
+      cogsTitle.textContent = 'Cost of goods per task ($) — materials, not labour.';
+      section.appendChild(cogsTitle);
+      relevantTasks.forEach(t => {
+        const r = document.createElement('div'); r.className = 'field-row';
+        const l = document.createElement('label'); l.textContent = t.name; l.style.minWidth = '160px';
+        r.appendChild(l);
+        const inp = document.createElement('input'); inp.type = 'number'; inp.min = '0'; inp.step = '0.01'; inp.style.width = '110px';
+        inp.value = financialDraftState.costOfGoodsByTask[t.id] || '';
+        inp.addEventListener('input', () => { financialDraftState.costOfGoodsByTask[t.id] = Number(inp.value) || 0; });
+        r.appendChild(inp);
+        section.appendChild(r);
+      });
+    }
+
+    const actionRow = document.createElement('div'); actionRow.style.marginTop = '12px'; actionRow.style.display = 'flex'; actionRow.style.gap = '8px';
+    const saveBtn = document.createElement('button'); saveBtn.className = 'primary'; saveBtn.textContent = 'Save report';
+    saveBtn.addEventListener('click', () => {
+      state.financialReports.push({
+        id: uid('finrep'), buildId: build.id,
+        jobNumber: eff.jobNumber, dealer: eff.dealer, customer: eff.customer, machineType: eff.machineType,
+        createdDate: getTodayISO(),
+        hourlyRate: financialDraftState.hourlyRate, sellPrice: financialDraftState.sellPrice,
+        costOfGoodsByTask: { ...financialDraftState.costOfGoodsByTask }
+      });
+      save();
+      financialDraftState = null;
+      renderFinancialPage();
+    });
+    actionRow.appendChild(saveBtn);
+    const cancelBtn = document.createElement('button'); cancelBtn.className = 'ghost'; cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', () => { financialDraftState = null; renderFinancialGeneratePanel(); });
+    actionRow.appendChild(cancelBtn);
+    section.appendChild(actionRow);
+  }
+
+  // A single horizontal bar row — used for both the per-job and per-machine-type charts below. `value` can be
+  // negative (a loss), which draws in the danger colour instead of good, off a shared zero point so gains and
+  // losses stay visually comparable.
+  function renderProfitBar(container, label, value, maxAbs){
+    const row = document.createElement('div'); row.style.display = 'flex'; row.style.alignItems = 'center'; row.style.gap = '10px'; row.style.marginBottom = '6px'; row.style.fontSize = '12.5px';
+    const labelEl = document.createElement('div'); labelEl.style.width = '180px'; labelEl.style.flexShrink = '0'; labelEl.style.overflow = 'hidden'; labelEl.style.textOverflow = 'ellipsis'; labelEl.style.whiteSpace = 'nowrap';
+    labelEl.textContent = label; labelEl.title = label;
+    row.appendChild(labelEl);
+    const track = document.createElement('div'); track.style.flex = '1'; track.style.height = '14px'; track.style.background = 'var(--surface-2)'; track.style.borderRadius = '3px'; track.style.position = 'relative'; track.style.overflow = 'hidden';
+    const pct = maxAbs > 0 ? Math.min(100, Math.abs(value) / maxAbs * 100) : 0;
+    const bar = document.createElement('div'); bar.style.height = '100%'; bar.style.width = pct + '%'; bar.style.background = value < 0 ? 'var(--critical)' : 'var(--good)'; bar.style.borderRadius = '3px';
+    track.appendChild(bar);
+    row.appendChild(track);
+    const valueEl = document.createElement('div'); valueEl.style.width = '90px'; valueEl.style.flexShrink = '0'; valueEl.style.textAlign = 'right'; valueEl.style.fontFamily = 'var(--font-mono)';
+    valueEl.style.color = value < 0 ? 'var(--critical)' : 'var(--good)';
+    valueEl.textContent = fmtMoney(value);
+    row.appendChild(valueEl);
+    container.appendChild(row);
+  }
+
+  function renderFinancialOverviewSection(){
+    const section = document.getElementById('financialOverviewSection');
+    if (!section) return;
+    section.innerHTML = '';
+
+    if (state.financialReports.length === 0) return; // nothing to summarize yet — Generate panel already explains why
+
+    const breakdowns = state.financialReports.map(r => financialReportBreakdown(r));
+
+    section.innerHTML = '<h2>Business performance</h2><div class="hint">Across every saved report below.</div>';
+
+    // Overall stat cards
+    const totals = breakdowns.reduce((acc, b) => {
+      acc.revenue += b.sellPrice; acc.cogs += b.totals.costOfGoods; acc.labour += b.totals.actualLabourCost;
+      acc.gross += b.grossProfit; acc.net += b.netProfit;
+      return acc;
+    }, { revenue: 0, cogs: 0, labour: 0, gross: 0, net: 0 });
+    const statGrid = document.createElement('div'); statGrid.className = 'jobcard-header'; statGrid.style.marginTop = '10px';
+    [
+      ['Total revenue', fmtMoney(totals.revenue)],
+      ['Total cost (goods + labour)', fmtMoney(totals.cogs + totals.labour)],
+      ['Total gross profit', fmtMoney(totals.gross)],
+      ['Total net profit', fmtMoney(totals.net)]
+    ].forEach(([l, v]) => {
+      const f = document.createElement('div'); f.className = 'jobcard-field';
+      f.innerHTML = `<span class="jobcard-field-label">${l}</span><span style="font-size:16px;font-weight:700">${v}</span>`;
+      statGrid.appendChild(f);
+    });
+    section.appendChild(statGrid);
+
+    // Per-job chart
+    const perJobTitle = document.createElement('div'); perJobTitle.style.marginTop = '18px'; perJobTitle.style.fontWeight = '700';
+    perJobTitle.textContent = 'Gross vs net profit per job';
+    section.appendChild(perJobTitle);
+    const maxAbsJob = Math.max(1, ...breakdowns.flatMap(b => [Math.abs(b.grossProfit), Math.abs(b.netProfit)]));
+    const perJobWrap = document.createElement('div'); perJobWrap.style.marginTop = '8px';
+    breakdowns.forEach(b => {
+      renderProfitBar(perJobWrap, b.jobLabel + ' (gross)', b.grossProfit, maxAbsJob);
+      renderProfitBar(perJobWrap, b.jobLabel + ' (net)', b.netProfit, maxAbsJob);
+    });
+    section.appendChild(perJobWrap);
+
+    // Grouped by machine type
+    const byMachine = new Map();
+    breakdowns.forEach(b => {
+      const key = b.machineType || '—';
+      if (!byMachine.has(key)) byMachine.set(key, { gross: 0, net: 0, count: 0 });
+      const g = byMachine.get(key);
+      g.gross += b.grossProfit; g.net += b.netProfit; g.count += 1;
+    });
+    const machineTitle = document.createElement('div'); machineTitle.style.marginTop = '18px'; machineTitle.style.fontWeight = '700';
+    machineTitle.textContent = 'Grouped by machine type';
+    section.appendChild(machineTitle);
+    const maxAbsMachine = Math.max(1, ...[...byMachine.values()].flatMap(v => [Math.abs(v.gross), Math.abs(v.net)]));
+    const machineWrap = document.createElement('div'); machineWrap.style.marginTop = '8px';
+    [...byMachine.entries()].sort((a, b) => b[1].net - a[1].net).forEach(([machineType, v]) => {
+      renderProfitBar(machineWrap, `${machineType} — gross (${v.count} job${v.count === 1 ? '' : 's'})`, v.gross, maxAbsMachine);
+      renderProfitBar(machineWrap, `${machineType} — net`, v.net, maxAbsMachine);
+    });
+    section.appendChild(machineWrap);
+  }
+
+  function renderFinancialReportsListSection(){
+    const section = document.getElementById('financialReportsListSection');
+    if (!section) return;
+    section.innerHTML = '<h2>Saved reports</h2><div class="hint">Click a report to see its full breakdown, correct a figure, or remove it.</div>';
+
+    if (state.financialReports.length === 0){
+      const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
+      empty.textContent = 'No reports generated yet.';
+      section.appendChild(empty);
+      return;
+    }
+
+    const list = document.createElement('div'); list.className = 'drill-list'; list.style.marginTop = '10px';
+    [...state.financialReports].reverse().forEach(report => {
+      const b = financialReportBreakdown(report);
+      const expanded = financialReportsExpanded.has(report.id);
+
+      const row = document.createElement('div'); row.className = 'drill-row';
+      const main = document.createElement('div'); main.className = 'drill-main';
+      main.innerHTML = `<div class="drill-title">${b.jobLabel}</div><div class="drill-sub">${b.machineType} — created ${fmtDateLong(report.createdDate)}</div>`;
+      row.appendChild(main);
+      const meta = document.createElement('div'); meta.className = 'drill-meta';
+      meta.style.color = b.netProfit < 0 ? 'var(--critical)' : 'var(--good)';
+      meta.textContent = `Net ${fmtMoney(b.netProfit)} ${expanded ? '▾' : '▸'}`;
+      row.appendChild(meta);
+      row.addEventListener('click', () => {
+        if (expanded) financialReportsExpanded.delete(report.id); else financialReportsExpanded.add(report.id);
+        renderFinancialReportsListSection();
+      });
+      list.appendChild(row);
+
+      if (expanded){
+        const panel = document.createElement('div'); panel.className = 'subtask-panel';
+
+        const editRow = document.createElement('div'); editRow.className = 'field-row';
+        const rateLabel = document.createElement('label'); rateLabel.textContent = 'Hourly rate ($)';
+        editRow.appendChild(rateLabel);
+        const rateInp = document.createElement('input'); rateInp.type = 'number'; rateInp.min = '0'; rateInp.step = '0.01'; rateInp.style.width = '90px';
+        rateInp.value = report.hourlyRate || '';
+        rateInp.addEventListener('change', () => { report.hourlyRate = Number(rateInp.value) || 0; save(); renderFinancialPage(); });
+        editRow.appendChild(rateInp);
+        const sellLabel = document.createElement('label'); sellLabel.textContent = 'Sell price ($)';
+        editRow.appendChild(sellLabel);
+        const sellInp = document.createElement('input'); sellInp.type = 'number'; sellInp.min = '0'; sellInp.step = '0.01'; sellInp.style.width = '110px';
+        sellInp.value = report.sellPrice || '';
+        sellInp.addEventListener('change', () => { report.sellPrice = Number(sellInp.value) || 0; save(); renderFinancialPage(); });
+        editRow.appendChild(sellInp);
+        panel.appendChild(editRow);
+
+        if (b.tasks.length === 0){
+          const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '8px';
+          empty.textContent = 'No task hours or cost of goods recorded for this job.';
+          panel.appendChild(empty);
+        } else {
+          const table = document.createElement('table'); table.className = 'editor'; table.style.marginTop = '10px';
+          table.innerHTML = '<thead><tr><th>Task</th><th style="width:90px">Planned hrs</th><th style="width:90px">Actual hrs</th><th style="width:90px">Variance</th><th style="width:100px">Labour cost</th><th style="width:110px">Cost of goods ($)</th></tr></thead>';
+          const tbody = document.createElement('tbody');
+          b.tasks.forEach(t => {
+            const tr = document.createElement('tr');
+            const tdName = document.createElement('td'); tdName.textContent = t.taskName; tr.appendChild(tdName);
+            const tdPlanned = document.createElement('td'); tdPlanned.textContent = (Math.round(t.plannedHours * 100) / 100) + 'h'; tr.appendChild(tdPlanned);
+            const tdActual = document.createElement('td'); tdActual.textContent = (Math.round(t.actualHours * 100) / 100) + 'h'; tr.appendChild(tdActual);
+            const tdVar = document.createElement('td');
+            tdVar.textContent = (t.hoursVariance > 0 ? '+' : '') + (Math.round(t.hoursVariance * 100) / 100) + 'h';
+            tdVar.style.color = t.hoursVariance > 0 ? 'var(--critical)' : (t.hoursVariance < 0 ? 'var(--good)' : '');
+            tr.appendChild(tdVar);
+            const tdLabour = document.createElement('td'); tdLabour.textContent = fmtMoney(t.actualLabourCost); tr.appendChild(tdLabour);
+            const tdCogs = document.createElement('td');
+            const cogsInp = document.createElement('input'); cogsInp.type = 'number'; cogsInp.min = '0'; cogsInp.step = '0.01';
+            cogsInp.value = report.costOfGoodsByTask[t.taskId] || '';
+            cogsInp.addEventListener('change', () => {
+              report.costOfGoodsByTask[t.taskId] = Number(cogsInp.value) || 0;
+              save(); renderFinancialPage();
+            });
+            tdCogs.appendChild(cogsInp); tr.appendChild(tdCogs);
+            tbody.appendChild(tr);
+          });
+          table.appendChild(tbody);
+          panel.appendChild(table);
+        }
+
+        const summary = document.createElement('div'); summary.className = 'jobcard-header'; summary.style.marginTop = '10px';
+        [
+          ['Sell price', fmtMoney(b.sellPrice)],
+          ['Cost of goods', fmtMoney(b.totals.costOfGoods)],
+          ['Labour cost (actual)', fmtMoney(b.totals.actualLabourCost)],
+          ['Gross profit', fmtMoney(b.grossProfit)],
+          ['Net profit', fmtMoney(b.netProfit)],
+          ['Net profit (if on budget hours)', fmtMoney(b.plannedNetProfit)]
+        ].forEach(([l, v]) => {
+          const f = document.createElement('div'); f.className = 'jobcard-field';
+          f.innerHTML = `<span class="jobcard-field-label">${l}</span><span>${v}</span>`;
+          summary.appendChild(f);
+        });
+        panel.appendChild(summary);
+
+        const delBtn = document.createElement('button'); delBtn.className = 'ghost icon'; delBtn.style.marginTop = '12px';
+        delBtn.textContent = '✕ Delete report';
+        delBtn.addEventListener('click', () => {
+          if (!confirm(`Delete the report for ${b.jobLabel}? This can't be undone.`)) return;
+          state.financialReports = state.financialReports.filter(r => r.id !== report.id);
+          financialReportsExpanded.delete(report.id);
+          save(); renderFinancialPage();
+        });
+        panel.appendChild(delBtn);
+
+        list.appendChild(panel);
+      }
+    });
+    section.appendChild(list);
+  }
+
   function renderReportsPage(){
     const container = document.getElementById('reportsSection');
     container.innerHTML = '';
@@ -6617,6 +7021,7 @@
     document.getElementById('page-jobcardslive').style.display = name === 'jobcardslive' ? '' : 'none';
     document.getElementById('page-archive').style.display = name === 'archive' ? '' : 'none';
     document.getElementById('page-reports').style.display = name === 'reports' ? '' : 'none';
+    document.getElementById('page-financial').style.display = name === 'financial' ? '' : 'none';
     document.getElementById('page-signoff').style.display = name === 'signoff' ? '' : 'none';
     document.getElementById('page-logins').style.display = name === 'logins' ? '' : 'none';
     document.getElementById('navLogins').classList.toggle('active', name === 'logins');
@@ -6629,6 +7034,7 @@
     document.getElementById('navJobCardsLive').classList.toggle('active', name === 'jobcardslive');
     document.getElementById('navArchive').classList.toggle('active', name === 'archive');
     document.getElementById('navReports').classList.toggle('active', name === 'reports');
+    document.getElementById('navFinancial').classList.toggle('active', name === 'financial');
     if (name === 'schedule'){ renderBuildTable(); renderResults(); }
     if (name === 'history') renderJobHistory();
     if (name === 'stock') renderStock();
@@ -6637,6 +7043,7 @@
     if (name === 'jobcardslive') renderJobCardsLivePage();
     if (name === 'archive') renderArchivePage();
     if (name === 'reports') renderReportsPage();
+    if (name === 'financial') renderFinancialPage();
     if (name === 'signoff') renderSignoffPage();
     if (name === 'logins') renderLoginsPage();
   }
@@ -6650,6 +7057,7 @@
   document.getElementById('navJobCardsLive').addEventListener('click', () => showPage('jobcardslive'));
   document.getElementById('navArchive').addEventListener('click', () => showPage('archive'));
   document.getElementById('navReports').addEventListener('click', () => showPage('reports'));
+  document.getElementById('navFinancial').addEventListener('click', () => showPage('financial'));
 
   document.getElementById('btnSample').addEventListener('click', () => {
     if (!confirm('Replace current setup and builds with sample data?')) return;
@@ -6759,6 +7167,8 @@
       renderArchivePage();
     } else if (document.getElementById('page-reports').style.display !== 'none'){
       renderReportsPage();
+    } else if (document.getElementById('page-financial').style.display !== 'none'){
+      renderFinancialPage();
     } else if (document.getElementById('page-signoff').style.display !== 'none'){
       renderSignoffPage();
     }
