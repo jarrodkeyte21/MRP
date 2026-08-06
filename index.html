@@ -1564,8 +1564,13 @@
       tasks, totals, sellPrice, hourlyRate,
       grossProfit, netProfit, plannedNetProfit,
       grossMarginPct: sellPrice ? (grossProfit / sellPrice) * 100 : null,
-      netMarginPct: sellPrice ? (netProfit / sellPrice) * 100 : null
+      netMarginPct: sellPrice ? (netProfit / sellPrice) * 100 : null,
+      plannedNetMarginPct: sellPrice ? (plannedNetProfit / sellPrice) * 100 : null
     };
+  }
+
+  function fmtPct(pct){
+    return pct === null || pct === undefined ? '—' : (Math.round(pct * 10) / 10) + '%';
   }
 
   // ---------- hours ticked off a build's real sub-task checklist (shop floor "Mark complete"), regardless of
@@ -6171,7 +6176,7 @@
           panel.appendChild(empty);
         } else {
           const table = document.createElement('table'); table.className = 'editor'; table.style.marginTop = '10px';
-          table.innerHTML = '<thead><tr><th>Task</th><th style="width:90px">Planned hrs</th><th style="width:90px">Actual hrs</th><th style="width:90px">Variance</th><th style="width:100px">Labour cost</th><th style="width:110px">Cost of goods ($)</th></tr></thead>';
+          table.innerHTML = '<thead><tr><th>Task</th><th style="width:90px">Planned hrs</th><th style="width:90px">Actual hrs</th><th style="width:90px">Variance</th><th style="width:100px">Labour (planned)</th><th style="width:100px">Labour (actual)</th><th style="width:110px">Cost of goods ($)</th></tr></thead>';
           const tbody = document.createElement('tbody');
           b.tasks.forEach(t => {
             const tr = document.createElement('tr');
@@ -6182,7 +6187,8 @@
             tdVar.textContent = (t.hoursVariance > 0 ? '+' : '') + (Math.round(t.hoursVariance * 100) / 100) + 'h';
             tdVar.style.color = t.hoursVariance > 0 ? 'var(--critical)' : (t.hoursVariance < 0 ? 'var(--good)' : '');
             tr.appendChild(tdVar);
-            const tdLabour = document.createElement('td'); tdLabour.textContent = fmtMoney(t.actualLabourCost); tr.appendChild(tdLabour);
+            const tdLabourPlanned = document.createElement('td'); tdLabourPlanned.textContent = fmtMoney(t.plannedLabourCost); tr.appendChild(tdLabourPlanned);
+            const tdLabourActual = document.createElement('td'); tdLabourActual.textContent = fmtMoney(t.actualLabourCost); tr.appendChild(tdLabourActual);
             const tdCogs = document.createElement('td');
             const cogsInp = document.createElement('input'); cogsInp.type = 'number'; cogsInp.min = '0'; cogsInp.step = '0.01';
             cogsInp.value = report.costOfGoodsByTask[t.taskId] || '';
@@ -6194,18 +6200,36 @@
             tbody.appendChild(tr);
           });
           table.appendChild(tbody);
+          const tfoot = document.createElement('tfoot');
+          const totalTr = document.createElement('tr'); totalTr.style.fontWeight = '700'; totalTr.style.borderTop = '2px solid var(--line)';
+          const tdTotalLabel = document.createElement('td'); tdTotalLabel.textContent = 'Total'; totalTr.appendChild(tdTotalLabel);
+          const tdTotalPlanned = document.createElement('td'); tdTotalPlanned.textContent = (Math.round(b.totals.plannedHours * 100) / 100) + 'h'; totalTr.appendChild(tdTotalPlanned);
+          const tdTotalActual = document.createElement('td'); tdTotalActual.textContent = (Math.round(b.totals.actualHours * 100) / 100) + 'h'; totalTr.appendChild(tdTotalActual);
+          const totalVariance = b.totals.actualHours - b.totals.plannedHours;
+          const tdTotalVar = document.createElement('td');
+          tdTotalVar.textContent = (totalVariance > 0 ? '+' : '') + (Math.round(totalVariance * 100) / 100) + 'h';
+          tdTotalVar.style.color = totalVariance > 0 ? 'var(--critical)' : (totalVariance < 0 ? 'var(--good)' : '');
+          totalTr.appendChild(tdTotalVar);
+          const tdTotalLabourPlanned = document.createElement('td'); tdTotalLabourPlanned.textContent = fmtMoney(b.totals.plannedLabourCost); totalTr.appendChild(tdTotalLabourPlanned);
+          const tdTotalLabourActual = document.createElement('td'); tdTotalLabourActual.textContent = fmtMoney(b.totals.actualLabourCost); totalTr.appendChild(tdTotalLabourActual);
+          const tdTotalCogs = document.createElement('td'); tdTotalCogs.textContent = fmtMoney(b.totals.costOfGoods); totalTr.appendChild(tdTotalCogs);
+          tfoot.appendChild(totalTr);
+          table.appendChild(tfoot);
           panel.appendChild(table);
         }
 
+        // Everything that has its own column above (hours, labour cost, cost of goods) is totalled in the
+        // table's own footer row, right under that column — nothing to repeat here. This block is only for
+        // figures that belong to the job as a whole, not to any one task row.
         const summary = document.createElement('div'); summary.className = 'jobcard-header'; summary.style.marginTop = '10px';
         [
           ['Sell price', fmtMoney(b.sellPrice)],
-          ['Cost of goods', fmtMoney(b.totals.costOfGoods)],
-          ['Labour cost (planned)', fmtMoney(b.totals.plannedLabourCost)],
-          ['Labour cost (actual)', fmtMoney(b.totals.actualLabourCost)],
           ['Gross profit', fmtMoney(b.grossProfit)],
+          ['Gross margin %', fmtPct(b.grossMarginPct)],
           ['Net profit (planned)', fmtMoney(b.plannedNetProfit)],
-          ['Net profit (actual)', fmtMoney(b.netProfit)]
+          ['Net margin % (planned)', fmtPct(b.plannedNetMarginPct)],
+          ['Net profit (actual)', fmtMoney(b.netProfit)],
+          ['Net margin % (actual)', fmtPct(b.netMarginPct)]
         ].forEach(([l, v]) => {
           const f = document.createElement('div'); f.className = 'jobcard-field';
           f.innerHTML = `<span class="jobcard-field-label">${l}</span><span>${v}</span>`;
