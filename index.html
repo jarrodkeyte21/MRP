@@ -622,6 +622,49 @@
     return { hours, dependsOn, maxPerDay };
   }
 
+  // ---------- Options: reusable add-ons (GPS kit, extra light bar, etc) that add labour to one or more tasks
+  // plus their own cost of goods — e.g. "GPS Guidance" might add 2h to Assembly and 1h to QC, each with its own
+  // materials cost. Applying one to a job just injects a normal sub-task per item (tagged with fromOptionId so
+  // it can be found/removed/reported on later) — hours flow into scheduling exactly like any other sub-task,
+  // no engine changes needed. Cost of goods for an option-tagged sub-task lives on the sub-task itself
+  // (optionCostOfGoods), separate from the per-task cost of goods a manager types into a Financial Report. ----------
+  function appliedOptionsForJob(jr){
+    const byOption = new Map();
+    jr.tasks.forEach(t => {
+      (t.subtasks || []).forEach(st => {
+        if (!st.fromOptionId) return;
+        if (!byOption.has(st.fromOptionId)) byOption.set(st.fromOptionId, { optionId: st.fromOptionId, optionName: st.fromOptionName, subtasks: [] });
+        byOption.get(st.fromOptionId).subtasks.push({ task: t, subtask: st });
+      });
+    });
+    return [...byOption.values()].map(o => ({
+      ...o,
+      totalHours: o.subtasks.reduce((sum, x) => sum + (Number(x.subtask.standardTime) || 0), 0),
+      totalCostOfGoods: o.subtasks.reduce((sum, x) => sum + (Number(x.subtask.optionCostOfGoods) || 0), 0)
+    }));
+  }
+
+  function addOptionToJob(jr, option){
+    option.items.forEach(item => {
+      let task = jr.tasks.find(t => t.taskRefId === item.taskId);
+      if (!task){
+        const setupTask = state.tasks.find(t => t.id === item.taskId);
+        task = { id: uid('jt'), taskRefId: item.taskId, name: setupTask ? setupTask.name : 'Task', dependsOn: [], maxPeople: null, subtasks: [] };
+        jr.tasks.push(task);
+      }
+      const nextNum = String((task.subtasks.length + 1) * 10);
+      task.subtasks.push({
+        id: uid('jst'), number: nextNum, name: item.subtaskName || option.name, notes: '', standardTime: Number(item.hours) || 0, selected: true,
+        completed: false, timeLogs: [], timerRunning: false,
+        fromOptionId: option.id, fromOptionName: option.name, optionCostOfGoods: Number(item.costOfGoods) || 0
+      });
+    });
+  }
+
+  function removeOptionFromJob(jr, optionId){
+    jr.tasks.forEach(t => { t.subtasks = (t.subtasks || []).filter(st => st.fromOptionId !== optionId); });
+  }
+
   // Links a build to a job record — pulls identity fields in once, and hours/dependencies/max-people/lead time
   // stay live off the job from then on (with the usual per-task override capability). Shared by the manual
   // "Apply job…" dropdown and the auto-sync that keeps every job showing up in Builds.
@@ -1150,6 +1193,8 @@
       if (r.hourlyRate === undefined) r.hourlyRate = 0;
       if (r.sellPrice === undefined) r.sellPrice = 0;
     });
+    if (!state.optionTemplates) state.optionTemplates = [];
+    state.optionTemplates.forEach(o => { if (!Array.isArray(o.items)) o.items = []; });
     if (state.meta.lastCheckedDate === undefined) state.meta.lastCheckedDate = null;
     // Sign-off is just a correction layered on top of the simulation now (see runSchedule), not a gate on the
     // start date — so the start date always rolls forward to today, every load, regardless of sign-off history.
@@ -1447,6 +1492,7 @@
   // level: 'main' (Jobs + Templates sections) or 'tasks' (drilled into one job's or one template's tasks).
   // mode distinguishes which collection recordId refers to when level is 'tasks': 'job' or 'template'.
   let jobsView = { level: 'main', mode: null, recordId: null, expandedTaskId: null };
+  let optionsExpanded = new Set();
 
   // ---------- date helpers ----------
   function parseISO(s){ const [y,m,d] = s.split('-').map(Number); return new Date(y, m-1, d); }
@@ -1532,8 +1578,33 @@
     const actualByTask = build ? actualHoursByTaskForBuild(build.id) : {};
     const cogsByTask = report.costOfGoodsByTask || {};
 
+    // Options add hours (and their own cost of goods) as ordinary tagged sub-tasks on the job record — split
+    // those back out here so a task's own labour/materials aren't mixed in with whatever options rode along on
+    // it. Only possible for a real job-linked build (a job record is where the fromOptionId tag lives); a build
+    // on the older flat machine-template path has no sub-task breakdown to split, so it just gets no options.
+    const jr = eff ? eff.jobRecord : null;
+    const optionPlannedByTask = {};
+    const optionRowsMap = new Map(); // `${optionId}|${taskId}` -> row
+    if (jr){
+      jr.tasks.forEach(t => {
+        if (!t.taskRefId) return;
+        (t.subtasks || []).forEach(st => {
+          if (!st.fromOptionId || !st.selected) return;
+          optionPlannedByTask[t.taskRefId] = (optionPlannedByTask[t.taskRefId] || 0) + (Number(st.standardTime) || 0);
+          const key = st.fromOptionId + '|' + t.taskRefId;
+          if (!optionRowsMap.has(key)){
+            optionRowsMap.set(key, { optionId: st.fromOptionId, optionName: st.fromOptionName, taskId: t.taskRefId, plannedHours: 0, actualHours: 0, costOfGoods: 0 });
+          }
+          const row = optionRowsMap.get(key);
+          row.plannedHours += Number(st.standardTime) || 0;
+          row.costOfGoods += Number(st.optionCostOfGoods) || 0;
+          row.actualHours += totalTimeUsedHours(st); // real clocked time on this exact sub-task, not an estimate
+        });
+      });
+    }
+
     const taskIds = new Set([
-      ...Object.keys(plannedByTask).filter(id => (Number(plannedByTask[id]) || 0) > 0),
+      ...Object.keys(plannedByTask).filter(id => (Number(plannedByTask[id]) || 0) > (Number(optionPlannedByTask[id]) || 0)),
       ...Object.keys(actualByTask).filter(id => (Number(actualByTask[id]) || 0) > 0),
       ...Object.keys(cogsByTask).filter(id => (Number(cogsByTask[id]) || 0) > 0)
     ]);
@@ -1542,8 +1613,12 @@
     const sellPrice = Number(report.sellPrice) || 0;
 
     const tasks = state.tasks.filter(t => taskIds.has(t.id)).map(t => {
-      const plannedHours = Number(plannedByTask[t.id]) || 0;
-      const actualHours = Number(actualByTask[t.id]) || 0;
+      const optionHours = Number(optionPlannedByTask[t.id]) || 0;
+      const optionActualForTask = [...optionRowsMap.values()].filter(r => r.taskId === t.id).reduce((s, r) => s + r.actualHours, 0);
+      const plannedHours = Math.max(0, (Number(plannedByTask[t.id]) || 0) - optionHours);
+      // Base actual = whatever's left of the task's signed-off actual once the real clocked time against its
+      // option sub-tasks is taken out — clamped at 0 in case sign-off and clocked time disagree slightly.
+      const actualHours = Math.max(0, (Number(actualByTask[t.id]) || 0) - optionActualForTask);
       const costOfGoods = Number(cogsByTask[t.id]) || 0;
       return {
         taskId: t.id, taskName: t.name,
@@ -1553,6 +1628,16 @@
       };
     }).sort((a, b) => a.taskName.localeCompare(b.taskName));
 
+    const options = [...optionRowsMap.values()].map(r => {
+      const t = state.tasks.find(x => x.id === r.taskId);
+      return {
+        optionId: r.optionId, optionName: r.optionName || '(unnamed option)', taskName: t ? t.name : '(unknown task)',
+        plannedHours: r.plannedHours, actualHours: r.actualHours,
+        plannedLabourCost: r.plannedHours * hourlyRate, actualLabourCost: r.actualHours * hourlyRate,
+        costOfGoods: r.costOfGoods
+      };
+    }).sort((a, b) => a.optionName.localeCompare(b.optionName) || a.taskName.localeCompare(b.taskName));
+
     const totals = tasks.reduce((acc, t) => {
       acc.plannedHours += t.plannedHours; acc.actualHours += t.actualHours;
       acc.plannedLabourCost += t.plannedLabourCost; acc.actualLabourCost += t.actualLabourCost;
@@ -1560,15 +1645,27 @@
       return acc;
     }, { plannedHours: 0, actualHours: 0, plannedLabourCost: 0, actualLabourCost: 0, costOfGoods: 0 });
 
-    const grossProfit = sellPrice - totals.costOfGoods;
-    const netProfit = grossProfit - totals.actualLabourCost;
-    const plannedNetProfit = grossProfit - totals.plannedLabourCost;
+    const optionTotals = options.reduce((acc, o) => {
+      acc.plannedHours += o.plannedHours; acc.actualHours += o.actualHours;
+      acc.plannedLabourCost += o.plannedLabourCost; acc.actualLabourCost += o.actualLabourCost;
+      acc.costOfGoods += o.costOfGoods;
+      return acc;
+    }, { plannedHours: 0, actualHours: 0, plannedLabourCost: 0, actualLabourCost: 0, costOfGoods: 0 });
+
+    const totalCostOfGoods = totals.costOfGoods + optionTotals.costOfGoods;
+    const totalPlannedLabour = totals.plannedLabourCost + optionTotals.plannedLabourCost;
+    const totalActualLabour = totals.actualLabourCost + optionTotals.actualLabourCost;
+
+    const grossProfit = sellPrice - totalCostOfGoods;
+    const netProfit = grossProfit - totalActualLabour;
+    const plannedNetProfit = grossProfit - totalPlannedLabour;
 
     return {
       build, eff,
       jobLabel: jobIdentityLabel(report.jobNumber, report.dealer, report.customer),
       machineType: report.machineType || (eff ? eff.machineType : '') || '—',
-      tasks, totals, sellPrice, hourlyRate,
+      tasks, totals, options, optionTotals, totalCostOfGoods, totalPlannedLabour, totalActualLabour,
+      sellPrice, hourlyRate,
       grossProfit, netProfit, plannedNetProfit,
       grossMarginPct: sellPrice ? (grossProfit / sellPrice) * 100 : null,
       netMarginPct: sellPrice ? (netProfit / sellPrice) * 100 : null,
@@ -6065,7 +6162,7 @@
 
     // Overall stat cards
     const totals = breakdowns.reduce((acc, b) => {
-      acc.revenue += b.sellPrice; acc.cogs += b.totals.costOfGoods; acc.labour += b.totals.actualLabourCost;
+      acc.revenue += b.sellPrice; acc.cogs += b.totalCostOfGoods; acc.labour += b.totalActualLabour;
       acc.gross += b.grossProfit; acc.net += b.netProfit; acc.plannedNet += b.plannedNetProfit;
       return acc;
     }, { revenue: 0, cogs: 0, labour: 0, gross: 0, net: 0, plannedNet: 0 });
@@ -6225,12 +6322,47 @@
           panel.appendChild(table);
         }
 
+        if (b.options.length > 0){
+          const optTitle = document.createElement('div'); optTitle.style.marginTop = '14px'; optTitle.style.fontWeight = '700';
+          optTitle.textContent = 'Options';
+          panel.appendChild(optTitle);
+          const optTable = document.createElement('table'); optTable.className = 'editor'; optTable.style.marginTop = '6px';
+          optTable.innerHTML = '<thead><tr><th>Option</th><th>Task</th><th style="width:90px">Planned hrs</th><th style="width:90px">Actual hrs</th><th style="width:100px">Labour (planned)</th><th style="width:100px">Labour (actual)</th><th style="width:110px">Cost of goods</th></tr></thead>';
+          const optTbody = document.createElement('tbody');
+          b.options.forEach(o => {
+            const tr = document.createElement('tr');
+            const tdOpt = document.createElement('td'); tdOpt.textContent = o.optionName; tr.appendChild(tdOpt);
+            const tdTask = document.createElement('td'); tdTask.textContent = o.taskName; tr.appendChild(tdTask);
+            const tdP = document.createElement('td'); tdP.textContent = (Math.round(o.plannedHours * 100) / 100) + 'h'; tr.appendChild(tdP);
+            const tdA = document.createElement('td'); tdA.textContent = (Math.round(o.actualHours * 100) / 100) + 'h'; tr.appendChild(tdA);
+            const tdLP = document.createElement('td'); tdLP.textContent = fmtMoney(o.plannedLabourCost); tr.appendChild(tdLP);
+            const tdLA = document.createElement('td'); tdLA.textContent = fmtMoney(o.actualLabourCost); tr.appendChild(tdLA);
+            const tdC = document.createElement('td'); tdC.textContent = fmtMoney(o.costOfGoods); tr.appendChild(tdC);
+            optTbody.appendChild(tr);
+          });
+          optTable.appendChild(optTbody);
+          const optTfoot = document.createElement('tfoot');
+          const optTotalTr = document.createElement('tr'); optTotalTr.style.fontWeight = '700'; optTotalTr.style.borderTop = '2px solid var(--line)';
+          const c1 = document.createElement('td'); c1.textContent = 'Total'; optTotalTr.appendChild(c1);
+          const c2 = document.createElement('td'); optTotalTr.appendChild(c2);
+          const c3 = document.createElement('td'); c3.textContent = (Math.round(b.optionTotals.plannedHours * 100) / 100) + 'h'; optTotalTr.appendChild(c3);
+          const c4 = document.createElement('td'); c4.textContent = (Math.round(b.optionTotals.actualHours * 100) / 100) + 'h'; optTotalTr.appendChild(c4);
+          const c5 = document.createElement('td'); c5.textContent = fmtMoney(b.optionTotals.plannedLabourCost); optTotalTr.appendChild(c5);
+          const c6 = document.createElement('td'); c6.textContent = fmtMoney(b.optionTotals.actualLabourCost); optTotalTr.appendChild(c6);
+          const c7 = document.createElement('td'); c7.textContent = fmtMoney(b.optionTotals.costOfGoods); optTotalTr.appendChild(c7);
+          optTfoot.appendChild(optTotalTr);
+          optTable.appendChild(optTfoot);
+          panel.appendChild(optTable);
+        }
+
         // Everything that has its own column above (hours, labour cost, cost of goods) is totalled in the
         // table's own footer row, right under that column — nothing to repeat here. This block is only for
         // figures that belong to the job as a whole, not to any one task row.
         const summary = document.createElement('div'); summary.className = 'jobcard-header'; summary.style.marginTop = '10px';
         [
           ['Sell price', fmtMoney(b.sellPrice)],
+          ['Cost of goods (tasks + options)', fmtMoney(b.totalCostOfGoods)],
+          ['Labour cost (actual, tasks + options)', fmtMoney(b.totalActualLabour)],
           ['Gross profit', fmtMoney(b.grossProfit)],
           ['Gross margin %', fmtPct(b.grossMarginPct)],
           ['Net profit (planned)', fmtMoney(b.plannedNetProfit)],
@@ -6755,6 +6887,135 @@
     tmplPanel.appendChild(addTmplBtn);
 
     container.appendChild(tmplPanel);
+
+    // ---- Options section ----
+    const optPanel = document.createElement('div'); optPanel.className = 'panel';
+    optPanel.innerHTML = '<h2>Options</h2><div class="hint">Add-ons (GPS kit, extra light bar, etc) that add labour to one or more tasks, each with its own cost of goods. Click one to define what it adds, then apply it to a job from that job\'s Tasks page.</div>';
+
+    if (state.optionTemplates.length === 0){
+      const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
+      empty.textContent = 'No options yet — add one below.';
+      optPanel.appendChild(empty);
+    } else {
+      const list = document.createElement('div'); list.className = 'drill-list'; list.style.marginTop = '10px';
+      state.optionTemplates.forEach(opt => {
+        const expanded = optionsExpanded.has(opt.id);
+        const row = document.createElement('div'); row.className = 'drill-row';
+
+        const main = document.createElement('div'); main.className = 'drill-main';
+        const nameInp = document.createElement('input'); nameInp.type = 'text'; nameInp.value = opt.name;
+        nameInp.placeholder = 'Option name (e.g. GPS Guidance)';
+        nameInp.addEventListener('click', (e) => e.stopPropagation());
+        nameInp.addEventListener('input', () => { opt.name = nameInp.value; save(); });
+        main.appendChild(nameInp);
+        row.appendChild(main);
+
+        const totalHours = opt.items.reduce((s, i) => s + (Number(i.hours) || 0), 0);
+        const totalCogs = opt.items.reduce((s, i) => s + (Number(i.costOfGoods) || 0), 0);
+        const meta = document.createElement('div'); meta.className = 'drill-meta';
+        meta.textContent = `${opt.items.length} item${opt.items.length === 1 ? '' : 's'} — ${totalHours}h, ${fmtMoney(totalCogs)} ${expanded ? '▾' : '▸'}`;
+        row.appendChild(meta);
+
+        const delBtn = document.createElement('button'); delBtn.className = 'icon ghost'; delBtn.textContent = '✕';
+        delBtn.title = 'Remove option';
+        delBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (!confirm(`Delete "${opt.name || 'this option'}"? Jobs it's already been added to keep their sub-tasks — this only removes it from the library.`)) return;
+          state.optionTemplates = state.optionTemplates.filter(x => x.id !== opt.id);
+          save(); renderJobsPage();
+        });
+        row.appendChild(delBtn);
+
+        row.addEventListener('click', () => {
+          if (expanded) optionsExpanded.delete(opt.id); else optionsExpanded.add(opt.id);
+          renderJobsPage();
+        });
+        list.appendChild(row);
+
+        if (expanded){
+          const panel = document.createElement('div'); panel.className = 'subtask-panel';
+          if (opt.items.length === 0){
+            const empty = document.createElement('div'); empty.className = 'dep-empty';
+            empty.textContent = 'No items yet — add one below.';
+            panel.appendChild(empty);
+          } else {
+            const table = document.createElement('table'); table.className = 'editor';
+            table.innerHTML = '<thead><tr><th>Task</th><th>Sub-task name</th><th style="width:80px">Hours</th><th style="width:110px">Cost of goods ($)</th><th></th></tr></thead>';
+            const tbody = document.createElement('tbody');
+            opt.items.forEach(item => {
+              const tr = document.createElement('tr');
+              const tdTask = document.createElement('td');
+              const taskSel = document.createElement('select');
+              const noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '— Pick a task —';
+              taskSel.appendChild(noneOpt);
+              state.tasks.forEach(t => {
+                const o = document.createElement('option'); o.value = t.id; o.textContent = t.name;
+                if (item.taskId === t.id) o.selected = true;
+                taskSel.appendChild(o);
+              });
+              taskSel.addEventListener('click', (e) => e.stopPropagation());
+              taskSel.addEventListener('change', () => { item.taskId = taskSel.value || null; save(); });
+              tdTask.appendChild(taskSel); tr.appendChild(tdTask);
+
+              const tdName = document.createElement('td');
+              const nameI = document.createElement('input'); nameI.type = 'text'; nameI.value = item.subtaskName || '';
+              nameI.placeholder = 'e.g. Install GPS antenna';
+              nameI.addEventListener('click', (e) => e.stopPropagation());
+              nameI.addEventListener('input', () => { item.subtaskName = nameI.value; save(); });
+              tdName.appendChild(nameI); tr.appendChild(tdName);
+
+              const tdHours = document.createElement('td');
+              const hoursI = makeHourInput(item.hours, (val) => { item.hours = Number(val) || 0; save(); renderJobsPage(); });
+              hoursI.addEventListener('click', (e) => e.stopPropagation());
+              tdHours.appendChild(hoursI); tr.appendChild(tdHours);
+
+              const tdCogs = document.createElement('td');
+              const cogsI = document.createElement('input'); cogsI.type = 'number'; cogsI.min = '0'; cogsI.step = '0.01';
+              cogsI.value = item.costOfGoods || '';
+              cogsI.addEventListener('click', (e) => e.stopPropagation());
+              cogsI.addEventListener('input', () => { item.costOfGoods = Number(cogsI.value) || 0; save(); renderJobsPage(); });
+              tdCogs.appendChild(cogsI); tr.appendChild(tdCogs);
+
+              const tdDel = document.createElement('td');
+              const itemDelBtn = document.createElement('button'); itemDelBtn.className = 'icon ghost'; itemDelBtn.textContent = '✕';
+              itemDelBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                opt.items = opt.items.filter(x => x.id !== item.id);
+                save(); renderJobsPage();
+              });
+              tdDel.appendChild(itemDelBtn); tr.appendChild(tdDel);
+
+              tbody.appendChild(tr);
+            });
+            table.appendChild(tbody);
+            panel.appendChild(table);
+          }
+          const addItemBtn = document.createElement('button'); addItemBtn.className = 'ghost icon'; addItemBtn.style.marginTop = '10px';
+          addItemBtn.textContent = '+ Add item';
+          addItemBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            opt.items.push({ id: uid('opti'), taskId: null, subtaskName: '', hours: 0, costOfGoods: 0 });
+            save(); renderJobsPage();
+          });
+          panel.appendChild(addItemBtn);
+          panel.addEventListener('click', (e) => e.stopPropagation());
+          list.appendChild(panel);
+        }
+      });
+      optPanel.appendChild(list);
+    }
+
+    const addOptBtn = document.createElement('button'); addOptBtn.className = 'ghost icon'; addOptBtn.style.marginTop = '12px';
+    addOptBtn.textContent = '+ Add option';
+    addOptBtn.addEventListener('click', () => {
+      const opt = { id: uid('opt'), name: 'New option', items: [] };
+      state.optionTemplates.push(opt);
+      optionsExpanded.add(opt.id);
+      save(); renderJobsPage();
+    });
+    optPanel.appendChild(addOptBtn);
+
+    container.appendChild(optPanel);
   }
 
   function renderTasksDrilldown(container, owner, crumbLabel){
@@ -6936,6 +7197,84 @@
     panel.appendChild(addBtn);
 
     container.appendChild(panel);
+
+    // Options only apply to real jobs, not the reusable machine templates — a template has no customer yet to
+    // have picked an option for.
+    if (jobsView.mode === 'job') renderJobOptionsPanel(container, owner);
+  }
+
+  // Which options have been applied to this job (derived from the fromOptionId tag on its sub-tasks — see
+  // appliedOptionsForJob), plus a picker to apply another one from the library.
+  function renderJobOptionsPanel(container, jr){
+    const panel = document.createElement('div'); panel.className = 'panel row-gap';
+    panel.innerHTML = '<h2>Options applied to this job</h2><div class="hint">Adds a sub-task (with its own hours and cost of goods) to the relevant task above for each item in the option — remove it here to pull all of them back out.</div>';
+
+    const applied = appliedOptionsForJob(jr);
+    if (applied.length === 0){
+      const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
+      empty.textContent = 'No options applied yet.';
+      panel.appendChild(empty);
+    } else {
+      const list = document.createElement('div'); list.className = 'drill-list'; list.style.marginTop = '10px';
+      applied.forEach(o => {
+        const row = document.createElement('div'); row.className = 'drill-row'; row.style.cursor = 'default'; row.style.flexWrap = 'wrap';
+        const main = document.createElement('div'); main.className = 'drill-main';
+        main.textContent = o.optionName || '(unnamed option)';
+        // Per-task hours breakdown right under the name — an option can touch more than one task, so the
+        // total alone wouldn't say where the hours actually landed.
+        const byTask = new Map();
+        o.subtasks.forEach(({ task, subtask }) => {
+          const label = jobTaskDisplayName(task);
+          byTask.set(label, (byTask.get(label) || 0) + (Number(subtask.standardTime) || 0));
+        });
+        const sub = document.createElement('div'); sub.className = 'drill-sub';
+        sub.textContent = [...byTask.entries()].map(([name, hrs]) => `${name}: ${hrs}h`).join(' · ');
+        main.appendChild(sub);
+        row.appendChild(main);
+        const meta = document.createElement('div'); meta.className = 'drill-meta';
+        meta.textContent = `${o.totalHours}h total, ${fmtMoney(o.totalCostOfGoods)}`;
+        row.appendChild(meta);
+        const delBtn = document.createElement('button'); delBtn.className = 'icon ghost'; delBtn.textContent = '✕';
+        delBtn.title = 'Remove this option from the job — pulls out every sub-task it added.';
+        delBtn.addEventListener('click', () => {
+          if (!confirm(`Remove "${o.optionName}" from this job? This deletes the ${o.subtasks.length} sub-task${o.subtasks.length === 1 ? '' : 's'} it added.`)) return;
+          removeOptionFromJob(jr, o.optionId);
+          save(); renderJobsPage(); renderResults();
+        });
+        row.appendChild(delBtn);
+        list.appendChild(row);
+      });
+      panel.appendChild(list);
+    }
+
+    const addRow = document.createElement('div'); addRow.className = 'field-row'; addRow.style.marginTop = '12px';
+    const sel = document.createElement('select');
+    if (state.optionTemplates.length === 0){
+      const o = document.createElement('option'); o.value = ''; o.textContent = 'No options in the library yet';
+      sel.appendChild(o); sel.disabled = true;
+    } else {
+      const noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '— Pick an option —';
+      sel.appendChild(noneOpt);
+      state.optionTemplates.forEach(opt => {
+        const o = document.createElement('option'); o.value = opt.id; o.textContent = opt.name || '(unnamed option)';
+        sel.appendChild(o);
+      });
+    }
+    addRow.appendChild(sel);
+    const addBtn = document.createElement('button'); addBtn.className = 'ghost icon';
+    addBtn.textContent = '+ Add option to this job';
+    addBtn.disabled = state.optionTemplates.length === 0;
+    addBtn.addEventListener('click', () => {
+      const opt = state.optionTemplates.find(x => x.id === sel.value);
+      if (!opt){ alert('Pick an option first.'); return; }
+      if (!opt.items.some(i => i.taskId)){ alert('That option has no items with a task picked yet — add one in the Options library first.'); return; }
+      addOptionToJob(jr, opt);
+      save(); renderJobsPage(); renderResults();
+    });
+    addRow.appendChild(addBtn);
+    panel.appendChild(addRow);
+
+    container.appendChild(panel);
   }
 
   // The sub-task table for one task, rendered inline underneath its row (not a separate page). owner is the
@@ -6965,7 +7304,13 @@
       nameInp.placeholder = 'Sub-task name';
       nameInp.addEventListener('click', (e) => e.stopPropagation());
       nameInp.addEventListener('input', () => { st.name = nameInp.value; save(); });
-      tdName.appendChild(nameInp); tr.appendChild(tdName);
+      tdName.appendChild(nameInp);
+      if (st.fromOptionId){
+        const optTag = document.createElement('div'); optTag.className = 'auto-tag';
+        optTag.textContent = `via option: ${st.fromOptionName || '(unnamed)'} — ${fmtMoney(st.optionCostOfGoods || 0)} cost of goods`;
+        tdName.appendChild(optTag);
+      }
+      tr.appendChild(tdName);
 
       const tdNotes = document.createElement('td');
       const notesInp = document.createElement('input'); notesInp.type = 'text'; notesInp.value = st.notes;
