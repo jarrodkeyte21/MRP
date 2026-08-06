@@ -10,7 +10,7 @@ create policy "Authenticated read/write" on app_state
 create table if not exists profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   email text,
-  role text not null default 'floor' check (role in ('manager','floor')),
+  role text not null default 'floor' check (role in ('manager','floor','sales')),
   person_id text,
   created_at timestamptz not null default now()
 );
@@ -43,3 +43,8 @@ create policy "managers manage profiles" on profiles
   for all to authenticated
   using (is_manager())
   with check (is_manager());
+
+-- 3. Added later: a "sales" role (Schedule & Builds and Stock only) alongside manager/floor. If profiles
+-- already existed with the old manager/floor-only check, run this once to widen it — safe to re-run.
+alter table profiles drop constraint if exists profiles_role_check;
+alter table profiles add constraint profiles_role_check check (role in ('manager','floor','sales'));

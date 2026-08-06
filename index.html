@@ -976,6 +976,13 @@
         b.style.display = (b.id === 'navJobCardsLive') ? '' : 'none';
       });
       showPage('jobcardslive');
+    } else if (role === 'sales'){
+      // Sales only ever needs to see what's on order and what's in stock — Schedule & Builds and Stock, same as
+      // everything else is hidden from floor: not reachable via nav, and showPage() below picks a safe default.
+      Array.from(document.querySelectorAll('.pagenav button')).forEach(b => {
+        b.style.display = (b.id === 'navSchedule' || b.id === 'navStock') ? '' : 'none';
+      });
+      showPage('schedule');
     } else {
       Array.from(document.querySelectorAll('.pagenav button')).forEach(b => { b.style.display = ''; });
       if (!isManager) showPage('jobcardslive'); // no profile row yet — safest default, nothing destructive reachable
@@ -1056,7 +1063,7 @@
         main.textContent = p.email || '(no email on file)';
         row.appendChild(main);
         const meta = document.createElement('div'); meta.className = 'drill-meta';
-        meta.textContent = p.role === 'manager' ? 'Manager' : `Floor — ${person ? (person.name || '(unnamed)') : 'not linked to a person yet'}`;
+        meta.textContent = p.role === 'manager' ? 'Manager' : p.role === 'sales' ? 'Sales — Schedule & Stock only' : `Floor — ${person ? (person.name || '(unnamed)') : 'not linked to a person yet'}`;
         row.appendChild(meta);
         listWrap.appendChild(row);
       });
@@ -1082,7 +1089,7 @@
     const roleRow = document.createElement('div'); roleRow.className = 'field-row'; roleRow.style.marginTop = '6px';
     const roleLabel = document.createElement('label'); roleLabel.textContent = 'Role'; roleRow.appendChild(roleLabel);
     const roleSel = document.createElement('select');
-    [['floor', 'Floor staff — only their own Job Card'], ['manager', 'Manager — full access']].forEach(([val, label]) => {
+    [['floor', 'Floor staff — only their own Job Card'], ['sales', 'Sales — Schedule & Builds and Stock only'], ['manager', 'Manager — full access']].forEach(([val, label]) => {
       const opt = document.createElement('option'); opt.value = val; opt.textContent = label; roleSel.appendChild(opt);
     });
     roleRow.appendChild(roleSel);
