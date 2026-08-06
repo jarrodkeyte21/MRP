@@ -1493,6 +1493,7 @@
   // mode distinguishes which collection recordId refers to when level is 'tasks': 'job' or 'template'.
   let jobsView = { level: 'main', mode: null, recordId: null, expandedTaskId: null };
   let optionsExpanded = new Set();
+  let optionsAppliedExpanded = new Set();
 
   // ---------- date helpers ----------
   function parseISO(s){ const [y,m,d] = s.split('-').map(Number); return new Date(y, m-1, d); }
@@ -3439,6 +3440,66 @@
       const subCount = newTasks.reduce((sum, t) => sum + t.subtasks.length, 0);
       alert(`Imported ${newTasks.length} task${newTasks.length === 1 ? '' : 's'} and ${subCount} sub-task${subCount === 1 ? '' : 's'} — replaced this template's previous tasks.`
         + (unresolvedDeps ? ` ${unresolvedDeps} dependency reference${unresolvedDeps === 1 ? '' : 's'} could not be matched to a task name and were skipped.` : ''));
+    };
+    reader.onerror = () => alert('Could not read that file.');
+    reader.readAsText(file);
+  }
+
+  const OPTION_CSV_HEADER = ['Task name', 'Sub-task name', 'Hours', 'Cost of goods'];
+
+  function exportOptionCsv(opt){
+    const rows = [OPTION_CSV_HEADER];
+    if (opt.items.length === 0){
+      rows.push(['', '', '', '']);
+    } else {
+      opt.items.forEach(item => {
+        const task = state.tasks.find(t => t.id === item.taskId);
+        rows.push([task ? task.name : '', item.subtaskName || '', item.hours || 0, item.costOfGoods || 0]);
+      });
+    }
+    const csv = rows.map(r => r.map(csvField).join(',')).join('\n');
+    const blob = new Blob([csv], {type:'text/csv'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${(opt.name || 'option').replace(/[^a-z0-9\-_]+/gi,'_')}.csv`;
+    a.click();
+  }
+
+  function importOptionCsv(opt, file){
+    // Same stale-reference hazard as importTemplateCsv above — capture the id and re-look-up the live option
+    // once the file read completes, in case the auto-refresh swapped state out from under the open file picker.
+    const optionId = opt.id;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const liveOpt = state.optionTemplates.find(x => x.id === optionId);
+      if (!liveOpt){
+        alert('Couldn\'t find that option anymore — the page may have refreshed while the file picker was open. Please try again.');
+        return;
+      }
+      const rows = parseCsv(String(reader.result || ''));
+      const dataRows = rows.slice(1); // first row is the header
+      const newItems = [];
+      let unmatchedTasks = 0;
+      dataRows.forEach(r => {
+        if (!r || r.every(c => (c || '').trim() === '')) return;
+        const [taskName, subtaskName, hoursStr, cogsStr] = r;
+        const trimmedTaskName = (taskName || '').trim();
+        const task = state.tasks.find(t => t.name.trim().toLowerCase() === trimmedTaskName.toLowerCase());
+        if (trimmedTaskName && !task) unmatchedTasks++;
+        newItems.push({
+          id: uid('opti'), taskId: task ? task.id : null,
+          subtaskName: (subtaskName || '').trim(),
+          hours: Number(hoursStr) || 0, costOfGoods: Number(cogsStr) || 0
+        });
+      });
+      if (newItems.length === 0){
+        alert('No item rows found in that CSV — expected header: ' + OPTION_CSV_HEADER.join(', '));
+        return;
+      }
+      liveOpt.items = newItems;
+      save(); renderJobsPage();
+      alert(`Imported ${newItems.length} item${newItems.length === 1 ? '' : 's'} — replaced this option's previous items.`
+        + (unmatchedTasks ? ` ${unmatchedTasks} row${unmatchedTasks === 1 ? '' : 's'} had a task name that didn't match a Setup task — pick it manually.` : ''));
     };
     reader.onerror = () => alert('Could not read that file.');
     reader.readAsText(file);
@@ -6890,7 +6951,7 @@
 
     // ---- Options section ----
     const optPanel = document.createElement('div'); optPanel.className = 'panel';
-    optPanel.innerHTML = '<h2>Options</h2><div class="hint">Add-ons (GPS kit, extra light bar, etc) that add labour to one or more tasks, each with its own cost of goods. Click one to define what it adds, then apply it to a job from that job\'s Tasks page.</div>';
+    optPanel.innerHTML = '<h2>Option Templates</h2><div class="hint">Add-ons (GPS kit, extra light bar, etc) that add labour to one or more tasks, each with its own cost of goods. Click one to define what it adds, then apply it to a job from that job\'s Tasks page.</div>';
 
     if (state.optionTemplates.length === 0){
       const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
@@ -6910,10 +6971,13 @@
         main.appendChild(nameInp);
         row.appendChild(main);
 
-        const totalHours = opt.items.reduce((s, i) => s + (Number(i.hours) || 0), 0);
-        const totalCogs = opt.items.reduce((s, i) => s + (Number(i.costOfGoods) || 0), 0);
-        const meta = document.createElement('div'); meta.className = 'drill-meta';
-        meta.textContent = `${opt.items.length} item${opt.items.length === 1 ? '' : 's'} — ${totalHours}h, ${fmtMoney(totalCogs)} ${expanded ? '▾' : '▸'}`;
+        const meta = document.createElement('div'); meta.className = 'drill-meta'; meta.id = 'option-meta-' + opt.id;
+        const refreshMeta = () => {
+          const totalHours = opt.items.reduce((s, i) => s + (Number(i.hours) || 0), 0);
+          const totalCogs = opt.items.reduce((s, i) => s + (Number(i.costOfGoods) || 0), 0);
+          meta.textContent = `${opt.items.length} item${opt.items.length === 1 ? '' : 's'} — ${totalHours}h, ${fmtMoney(totalCogs)} ${expanded ? '▾' : '▸'}`;
+        };
+        refreshMeta();
         row.appendChild(meta);
 
         const delBtn = document.createElement('button'); delBtn.className = 'icon ghost'; delBtn.textContent = '✕';
@@ -6965,7 +7029,7 @@
               tdName.appendChild(nameI); tr.appendChild(tdName);
 
               const tdHours = document.createElement('td');
-              const hoursI = makeHourInput(item.hours, (val) => { item.hours = Number(val) || 0; save(); renderJobsPage(); });
+              const hoursI = makeHourInput(item.hours, (val) => { item.hours = Number(val) || 0; save(); refreshMeta(); });
               hoursI.addEventListener('click', (e) => e.stopPropagation());
               tdHours.appendChild(hoursI); tr.appendChild(tdHours);
 
@@ -6973,7 +7037,7 @@
               const cogsI = document.createElement('input'); cogsI.type = 'number'; cogsI.min = '0'; cogsI.step = '0.01';
               cogsI.value = item.costOfGoods || '';
               cogsI.addEventListener('click', (e) => e.stopPropagation());
-              cogsI.addEventListener('input', () => { item.costOfGoods = Number(cogsI.value) || 0; save(); renderJobsPage(); });
+              cogsI.addEventListener('input', () => { item.costOfGoods = Number(cogsI.value) || 0; save(); refreshMeta(); });
               tdCogs.appendChild(cogsI); tr.appendChild(tdCogs);
 
               const tdDel = document.createElement('td');
@@ -6998,6 +7062,29 @@
             save(); renderJobsPage();
           });
           panel.appendChild(addItemBtn);
+
+          const exportBtn = document.createElement('button'); exportBtn.className = 'ghost icon'; exportBtn.style.marginTop = '10px'; exportBtn.style.marginLeft = '8px';
+          exportBtn.textContent = 'Export CSV';
+          exportBtn.addEventListener('click', (e) => { e.stopPropagation(); exportOptionCsv(opt); });
+          panel.appendChild(exportBtn);
+
+          const importBtn = document.createElement('button'); importBtn.className = 'ghost icon'; importBtn.style.marginTop = '10px'; importBtn.style.marginLeft = '8px';
+          importBtn.textContent = 'Import CSV (replaces items)';
+          importBtn.title = 'Columns: ' + OPTION_CSV_HEADER.join(', ') + ' — task name must match a Setup task name.';
+          importBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const fileInp = document.createElement('input');
+            fileInp.type = 'file'; fileInp.accept = '.csv,text/csv';
+            fileInp.style.display = 'none';
+            fileInp.addEventListener('change', () => {
+              if (fileInp.files && fileInp.files[0]) importOptionCsv(opt, fileInp.files[0]);
+              fileInp.remove();
+            });
+            document.body.appendChild(fileInp);
+            fileInp.click();
+          });
+          panel.appendChild(importBtn);
+
           panel.addEventListener('click', (e) => e.stopPropagation());
           list.appendChild(panel);
         }
@@ -7207,7 +7294,7 @@
   // appliedOptionsForJob), plus a picker to apply another one from the library.
   function renderJobOptionsPanel(container, jr){
     const panel = document.createElement('div'); panel.className = 'panel row-gap';
-    panel.innerHTML = '<h2>Options applied to this job</h2><div class="hint">Adds a sub-task (with its own hours and cost of goods) to the relevant task above for each item in the option — remove it here to pull all of them back out.</div>';
+    panel.innerHTML = '<h2>Options</h2><div class="hint">Adds a sub-task (with its own hours and cost of goods) to the relevant task above for each item in the option — click one to adjust its hours/cost of goods just for this job (this never touches the option template in the library), or remove it here to pull all of them back out.</div>';
 
     const applied = appliedOptionsForJob(jr);
     if (applied.length === 0){
@@ -7217,7 +7304,8 @@
     } else {
       const list = document.createElement('div'); list.className = 'drill-list'; list.style.marginTop = '10px';
       applied.forEach(o => {
-        const row = document.createElement('div'); row.className = 'drill-row'; row.style.cursor = 'default'; row.style.flexWrap = 'wrap';
+        const expanded = optionsAppliedExpanded.has(o.optionId);
+        const row = document.createElement('div'); row.className = 'drill-row'; row.style.flexWrap = 'wrap';
         const main = document.createElement('div'); main.className = 'drill-main';
         main.textContent = o.optionName || '(unnamed option)';
         // Per-task hours breakdown right under the name — an option can touch more than one task, so the
@@ -7232,17 +7320,70 @@
         main.appendChild(sub);
         row.appendChild(main);
         const meta = document.createElement('div'); meta.className = 'drill-meta';
-        meta.textContent = `${o.totalHours}h total, ${fmtMoney(o.totalCostOfGoods)}`;
+        meta.textContent = `${o.totalHours}h total, ${fmtMoney(o.totalCostOfGoods)} ${expanded ? '▾' : '▸'}`;
         row.appendChild(meta);
         const delBtn = document.createElement('button'); delBtn.className = 'icon ghost'; delBtn.textContent = '✕';
         delBtn.title = 'Remove this option from the job — pulls out every sub-task it added.';
-        delBtn.addEventListener('click', () => {
+        delBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
           if (!confirm(`Remove "${o.optionName}" from this job? This deletes the ${o.subtasks.length} sub-task${o.subtasks.length === 1 ? '' : 's'} it added.`)) return;
           removeOptionFromJob(jr, o.optionId);
           save(); renderJobsPage(); renderResults();
         });
         row.appendChild(delBtn);
+        row.addEventListener('click', () => {
+          if (expanded) optionsAppliedExpanded.delete(o.optionId); else optionsAppliedExpanded.add(o.optionId);
+          renderJobsPage();
+        });
         list.appendChild(row);
+
+        if (expanded){
+          // Editing here changes only this job's own copy of the sub-task (created back when the option was
+          // added) — the option template in the library above is never touched, same as a job's tasks already
+          // being their own independent copy once created from a template.
+          const editPanel = document.createElement('div'); editPanel.className = 'subtask-panel';
+          const table = document.createElement('table'); table.className = 'editor';
+          table.innerHTML = '<thead><tr><th>Task</th><th>Sub-task name</th><th style="width:80px">Hours</th><th style="width:110px">Cost of goods ($)</th><th></th></tr></thead>';
+          const tbody = document.createElement('tbody');
+          o.subtasks.forEach(({ task, subtask }) => {
+            const tr = document.createElement('tr');
+            const tdTask = document.createElement('td'); tdTask.textContent = jobTaskDisplayName(task); tr.appendChild(tdTask);
+
+            const tdName = document.createElement('td');
+            const nameI = document.createElement('input'); nameI.type = 'text'; nameI.value = subtask.name || '';
+            nameI.addEventListener('input', () => { subtask.name = nameI.value; save(); });
+            tdName.appendChild(nameI); tr.appendChild(tdName);
+
+            const tdHours = document.createElement('td');
+            const hoursI = makeHourInput(subtask.standardTime, (val) => {
+              subtask.standardTime = Number(val) || 0; save();
+              const outerHrs = document.getElementById('jobtask-hours-' + task.id);
+              if (outerHrs) outerHrs.textContent = jobTaskSelectedHours(task);
+            });
+            tdHours.appendChild(hoursI); tr.appendChild(tdHours);
+
+            const tdCogs = document.createElement('td');
+            const cogsI = document.createElement('input'); cogsI.type = 'number'; cogsI.min = '0'; cogsI.step = '0.01';
+            cogsI.value = subtask.optionCostOfGoods || '';
+            cogsI.addEventListener('input', () => { subtask.optionCostOfGoods = Number(cogsI.value) || 0; save(); });
+            tdCogs.appendChild(cogsI); tr.appendChild(tdCogs);
+
+            const tdDel = document.createElement('td');
+            const itemDelBtn = document.createElement('button'); itemDelBtn.className = 'icon ghost'; itemDelBtn.textContent = '✕';
+            itemDelBtn.title = 'Remove just this one item — the rest of the option stays applied.';
+            itemDelBtn.addEventListener('click', () => {
+              task.subtasks = task.subtasks.filter(x => x.id !== subtask.id);
+              save(); renderJobsPage(); renderResults();
+            });
+            tdDel.appendChild(itemDelBtn); tr.appendChild(tdDel);
+
+            tbody.appendChild(tr);
+          });
+          table.appendChild(tbody);
+          editPanel.appendChild(table);
+          editPanel.addEventListener('click', (e) => e.stopPropagation());
+          list.appendChild(editPanel);
+        }
       });
       panel.appendChild(list);
     }
