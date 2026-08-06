@@ -1494,6 +1494,7 @@
   let jobsView = { level: 'main', mode: null, recordId: null, expandedTaskId: null };
   let optionsExpanded = new Set();
   let optionsAppliedExpanded = new Set();
+  let customOptionDraft = null; // { name, items: [{id, taskId, subtaskName, hours, costOfGoods}] } while building a one-off option for a job
 
   // ---------- date helpers ----------
   function parseISO(s){ const [y,m,d] = s.split('-').map(Number); return new Date(y, m-1, d); }
@@ -7414,6 +7415,106 @@
     });
     addRow.appendChild(addBtn);
     panel.appendChild(addRow);
+
+    // A one-off option built just for this job — never saved to the Option Templates library, so it won't show
+    // up as something to apply to any other job. Same addOptionToJob() plumbing as picking from the library;
+    // the only difference is where the option object itself comes from.
+    const customWrap = document.createElement('div'); customWrap.style.marginTop = '14px'; customWrap.style.paddingTop = '12px'; customWrap.style.borderTop = '1px dashed var(--line)';
+    if (!customOptionDraft){
+      const customBtn = document.createElement('button'); customBtn.className = 'ghost icon';
+      customBtn.textContent = '+ Create custom option for this job';
+      customBtn.addEventListener('click', () => {
+        customOptionDraft = { name: '', items: [{ id: uid('opti'), taskId: null, subtaskName: '', hours: 0, costOfGoods: 0 }] };
+        renderJobsPage();
+      });
+      customWrap.appendChild(customBtn);
+    } else {
+      const title = document.createElement('div'); title.style.fontWeight = '700';
+      title.textContent = 'Custom option for this job only';
+      customWrap.appendChild(title);
+      const hint = document.createElement('div'); hint.className = 'hint';
+      hint.textContent = 'Not saved to the Option Templates library — just adds these sub-tasks to this job.';
+      customWrap.appendChild(hint);
+
+      const nameRow = document.createElement('div'); nameRow.className = 'field-row'; nameRow.style.marginTop = '6px';
+      const nameLabel = document.createElement('label'); nameLabel.textContent = 'Name';
+      nameRow.appendChild(nameLabel);
+      const nameInp = document.createElement('input'); nameInp.type = 'text'; nameInp.value = customOptionDraft.name;
+      nameInp.placeholder = 'e.g. Customer-specific bracket';
+      nameInp.addEventListener('input', () => { customOptionDraft.name = nameInp.value; });
+      nameRow.appendChild(nameInp);
+      customWrap.appendChild(nameRow);
+
+      const table = document.createElement('table'); table.className = 'editor'; table.style.marginTop = '8px';
+      table.innerHTML = '<thead><tr><th>Task</th><th>Sub-task name</th><th style="width:80px">Hours</th><th style="width:110px">Cost of goods ($)</th><th></th></tr></thead>';
+      const tbody = document.createElement('tbody');
+      customOptionDraft.items.forEach(item => {
+        const tr = document.createElement('tr');
+        const tdTask = document.createElement('td');
+        const taskSel = document.createElement('select');
+        const noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '— Pick a task —';
+        taskSel.appendChild(noneOpt);
+        state.tasks.forEach(t => {
+          const o = document.createElement('option'); o.value = t.id; o.textContent = t.name;
+          if (item.taskId === t.id) o.selected = true;
+          taskSel.appendChild(o);
+        });
+        taskSel.addEventListener('change', () => { item.taskId = taskSel.value || null; });
+        tdTask.appendChild(taskSel); tr.appendChild(tdTask);
+
+        const tdName = document.createElement('td');
+        const nameI = document.createElement('input'); nameI.type = 'text'; nameI.value = item.subtaskName || '';
+        nameI.placeholder = 'e.g. Fit custom bracket';
+        nameI.addEventListener('input', () => { item.subtaskName = nameI.value; });
+        tdName.appendChild(nameI); tr.appendChild(tdName);
+
+        const tdHours = document.createElement('td');
+        const hoursI = makeHourInput(item.hours, (val) => { item.hours = Number(val) || 0; });
+        tdHours.appendChild(hoursI); tr.appendChild(tdHours);
+
+        const tdCogs = document.createElement('td');
+        const cogsI = document.createElement('input'); cogsI.type = 'number'; cogsI.min = '0'; cogsI.step = '0.01';
+        cogsI.value = item.costOfGoods || '';
+        cogsI.addEventListener('input', () => { item.costOfGoods = Number(cogsI.value) || 0; });
+        tdCogs.appendChild(cogsI); tr.appendChild(tdCogs);
+
+        const tdDel = document.createElement('td');
+        const delItemBtn = document.createElement('button'); delItemBtn.className = 'icon ghost'; delItemBtn.textContent = '✕';
+        delItemBtn.addEventListener('click', () => {
+          customOptionDraft.items = customOptionDraft.items.filter(x => x.id !== item.id);
+          renderJobsPage();
+        });
+        tdDel.appendChild(delItemBtn); tr.appendChild(tdDel);
+
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      customWrap.appendChild(table);
+
+      const addItemBtn = document.createElement('button'); addItemBtn.className = 'ghost icon'; addItemBtn.style.marginTop = '8px';
+      addItemBtn.textContent = '+ Add item';
+      addItemBtn.addEventListener('click', () => {
+        customOptionDraft.items.push({ id: uid('opti'), taskId: null, subtaskName: '', hours: 0, costOfGoods: 0 });
+        renderJobsPage();
+      });
+      customWrap.appendChild(addItemBtn);
+
+      const actionRow = document.createElement('div'); actionRow.style.marginTop = '10px'; actionRow.style.display = 'flex'; actionRow.style.gap = '8px';
+      const applyBtn = document.createElement('button'); applyBtn.className = 'primary'; applyBtn.textContent = 'Apply to job';
+      applyBtn.addEventListener('click', () => {
+        if (!customOptionDraft.items.some(i => i.taskId)){ alert('Pick a task for at least one item first.'); return; }
+        const customOpt = { id: uid('opt'), name: customOptionDraft.name.trim() || 'Custom option', items: customOptionDraft.items };
+        addOptionToJob(jr, customOpt);
+        customOptionDraft = null;
+        save(); renderJobsPage(); renderResults();
+      });
+      actionRow.appendChild(applyBtn);
+      const cancelBtn = document.createElement('button'); cancelBtn.className = 'ghost'; cancelBtn.textContent = 'Cancel';
+      cancelBtn.addEventListener('click', () => { customOptionDraft = null; renderJobsPage(); });
+      actionRow.appendChild(cancelBtn);
+      customWrap.appendChild(actionRow);
+    }
+    panel.appendChild(customWrap);
 
     container.appendChild(panel);
   }
