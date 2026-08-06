@@ -622,12 +622,12 @@
     return { hours, dependsOn, maxPerDay };
   }
 
-  // ---------- Options: reusable add-ons (GPS kit, extra light bar, etc) that add labour to one or more tasks
-  // plus their own cost of goods — e.g. "GPS Guidance" might add 2h to Assembly and 1h to QC, each with its own
-  // materials cost. Applying one to a job just injects a normal sub-task per item (tagged with fromOptionId so
-  // it can be found/removed/reported on later) — hours flow into scheduling exactly like any other sub-task,
-  // no engine changes needed. Cost of goods for an option-tagged sub-task lives on the sub-task itself
-  // (optionCostOfGoods), separate from the per-task cost of goods a manager types into a Financial Report. ----------
+  // ---------- Options: reusable add-ons (GPS kit, extra light bar, etc) that add labour to one or more tasks —
+  // e.g. "GPS Guidance" might add 2h to Assembly and 1h to QC. Applying one to a job just injects a normal
+  // sub-task per item (tagged with fromOptionId so it can be found/removed/reported on later) — hours flow into
+  // scheduling exactly like any other sub-task, no engine changes needed. Cost of goods for an option is
+  // deliberately NOT set here — it's entered per (option, task) when a Financial Report is generated, same as a
+  // regular task's cost of goods, rather than being baked into the job or the option itself. ----------
   function appliedOptionsForJob(jr){
     const byOption = new Map();
     jr.tasks.forEach(t => {
@@ -639,8 +639,7 @@
     });
     return [...byOption.values()].map(o => ({
       ...o,
-      totalHours: o.subtasks.reduce((sum, x) => sum + (Number(x.subtask.standardTime) || 0), 0),
-      totalCostOfGoods: o.subtasks.reduce((sum, x) => sum + (Number(x.subtask.optionCostOfGoods) || 0), 0)
+      totalHours: o.subtasks.reduce((sum, x) => sum + (Number(x.subtask.standardTime) || 0), 0)
     }));
   }
 
@@ -656,7 +655,7 @@
       task.subtasks.push({
         id: uid('jst'), number: nextNum, name: item.subtaskName || option.name, notes: '', standardTime: Number(item.hours) || 0, selected: true,
         completed: false, timeLogs: [], timerRunning: false,
-        fromOptionId: option.id, fromOptionName: option.name, optionCostOfGoods: Number(item.costOfGoods) || 0
+        fromOptionId: option.id, fromOptionName: option.name
       });
     });
   }
@@ -1190,6 +1189,7 @@
     if (!state.financialReports) state.financialReports = [];
     state.financialReports.forEach(r => {
       if (!r.costOfGoodsByTask) r.costOfGoodsByTask = {};
+      if (!r.costOfGoodsByOption) r.costOfGoodsByOption = {};
       if (r.hourlyRate === undefined) r.hourlyRate = 0;
       if (r.sellPrice === undefined) r.sellPrice = 0;
     });
@@ -1494,7 +1494,8 @@
   let jobsView = { level: 'main', mode: null, recordId: null, expandedTaskId: null };
   let optionsExpanded = new Set();
   let optionsAppliedExpanded = new Set();
-  let customOptionDraft = null; // { name, items: [{id, taskId, subtaskName, hours, costOfGoods}] } while building a one-off option for a job
+  let optionsAppliedTaskExpanded = new Set(); // keyed `${optionId}|${taskId}`
+  let customOptionDraft = null; // { name, items: [{id, taskId, subtaskName, hours}] } while building a one-off option for a job
 
   // ---------- date helpers ----------
   function parseISO(s){ const [y,m,d] = s.split('-').map(Number); return new Date(y, m-1, d); }
@@ -1579,11 +1580,14 @@
     const plannedByTask = eff ? eff.hours : {};
     const actualByTask = build ? actualHoursByTaskForBuild(build.id) : {};
     const cogsByTask = report.costOfGoodsByTask || {};
+    const cogsByOption = report.costOfGoodsByOption || {};
 
-    // Options add hours (and their own cost of goods) as ordinary tagged sub-tasks on the job record — split
-    // those back out here so a task's own labour/materials aren't mixed in with whatever options rode along on
-    // it. Only possible for a real job-linked build (a job record is where the fromOptionId tag lives); a build
-    // on the older flat machine-template path has no sub-task breakdown to split, so it just gets no options.
+    // Options add hours as ordinary tagged sub-tasks on the job record — split those back out here so a
+    // task's own labour isn't mixed in with whatever options rode along on it. Cost of goods for an option is
+    // NOT stored on the job at all — it's entered per (option, task) right here in the report, same as a
+    // regular task's cost of goods, via cogsByOption. Only possible for a real job-linked build (a job record
+    // is where the fromOptionId tag lives); a build on the older flat machine-template path has no sub-task
+    // breakdown to split, so it just gets no options.
     const jr = eff ? eff.jobRecord : null;
     const optionPlannedByTask = {};
     const optionRowsMap = new Map(); // `${optionId}|${taskId}` -> row
@@ -1595,11 +1599,10 @@
           optionPlannedByTask[t.taskRefId] = (optionPlannedByTask[t.taskRefId] || 0) + (Number(st.standardTime) || 0);
           const key = st.fromOptionId + '|' + t.taskRefId;
           if (!optionRowsMap.has(key)){
-            optionRowsMap.set(key, { optionId: st.fromOptionId, optionName: st.fromOptionName, taskId: t.taskRefId, plannedHours: 0, actualHours: 0, costOfGoods: 0 });
+            optionRowsMap.set(key, { optionId: st.fromOptionId, optionName: st.fromOptionName, taskId: t.taskRefId, plannedHours: 0, actualHours: 0, costOfGoods: Number(cogsByOption[key]) || 0 });
           }
           const row = optionRowsMap.get(key);
           row.plannedHours += Number(st.standardTime) || 0;
-          row.costOfGoods += Number(st.optionCostOfGoods) || 0;
           row.actualHours += totalTimeUsedHours(st); // real clocked time on this exact sub-task, not an estimate
         });
       });
@@ -1633,7 +1636,7 @@
     const options = [...optionRowsMap.values()].map(r => {
       const t = state.tasks.find(x => x.id === r.taskId);
       return {
-        optionId: r.optionId, optionName: r.optionName || '(unnamed option)', taskName: t ? t.name : '(unknown task)',
+        optionId: r.optionId, taskId: r.taskId, optionName: r.optionName || '(unnamed option)', taskName: t ? t.name : '(unknown task)',
         plannedHours: r.plannedHours, actualHours: r.actualHours,
         plannedLabourCost: r.plannedHours * hourlyRate, actualLabourCost: r.actualHours * hourlyRate,
         costOfGoods: r.costOfGoods
@@ -3446,16 +3449,16 @@
     reader.readAsText(file);
   }
 
-  const OPTION_CSV_HEADER = ['Task name', 'Sub-task name', 'Hours', 'Cost of goods'];
+  const OPTION_CSV_HEADER = ['Task name', 'Sub-task name', 'Hours'];
 
   function exportOptionCsv(opt){
     const rows = [OPTION_CSV_HEADER];
     if (opt.items.length === 0){
-      rows.push(['', '', '', '']);
+      rows.push(['', '', '']);
     } else {
       opt.items.forEach(item => {
         const task = state.tasks.find(t => t.id === item.taskId);
-        rows.push([task ? task.name : '', item.subtaskName || '', item.hours || 0, item.costOfGoods || 0]);
+        rows.push([task ? task.name : '', item.subtaskName || '', item.hours || 0]);
       });
     }
     const csv = rows.map(r => r.map(csvField).join(',')).join('\n');
@@ -3483,14 +3486,14 @@
       let unmatchedTasks = 0;
       dataRows.forEach(r => {
         if (!r || r.every(c => (c || '').trim() === '')) return;
-        const [taskName, subtaskName, hoursStr, cogsStr] = r;
+        const [taskName, subtaskName, hoursStr] = r;
         const trimmedTaskName = (taskName || '').trim();
         const task = state.tasks.find(t => t.name.trim().toLowerCase() === trimmedTaskName.toLowerCase());
         if (trimmedTaskName && !task) unmatchedTasks++;
         newItems.push({
           id: uid('opti'), taskId: task ? task.id : null,
           subtaskName: (subtaskName || '').trim(),
-          hours: Number(hoursStr) || 0, costOfGoods: Number(cogsStr) || 0
+          hours: Number(hoursStr) || 0
         });
       });
       if (newItems.length === 0){
@@ -6178,7 +6181,8 @@
         jobNumber: eff.jobNumber, dealer: eff.dealer, customer: eff.customer, machineType: eff.machineType,
         createdDate: getTodayISO(),
         hourlyRate: financialDraftState.hourlyRate, sellPrice: financialDraftState.sellPrice,
-        costOfGoodsByTask: { ...financialDraftState.costOfGoodsByTask }
+        costOfGoodsByTask: { ...financialDraftState.costOfGoodsByTask },
+        costOfGoodsByOption: {}
       });
       save();
       financialDraftState = null;
@@ -6389,7 +6393,7 @@
           optTitle.textContent = 'Options';
           panel.appendChild(optTitle);
           const optTable = document.createElement('table'); optTable.className = 'editor'; optTable.style.marginTop = '6px';
-          optTable.innerHTML = '<thead><tr><th>Option</th><th>Task</th><th style="width:90px">Planned hrs</th><th style="width:90px">Actual hrs</th><th style="width:100px">Labour (planned)</th><th style="width:100px">Labour (actual)</th><th style="width:110px">Cost of goods</th></tr></thead>';
+          optTable.innerHTML = '<thead><tr><th>Option</th><th>Task</th><th style="width:90px">Planned hrs</th><th style="width:90px">Actual hrs</th><th style="width:100px">Labour (planned)</th><th style="width:100px">Labour (actual)</th><th style="width:110px">Cost of goods ($)</th></tr></thead>';
           const optTbody = document.createElement('tbody');
           b.options.forEach(o => {
             const tr = document.createElement('tr');
@@ -6399,7 +6403,15 @@
             const tdA = document.createElement('td'); tdA.textContent = (Math.round(o.actualHours * 100) / 100) + 'h'; tr.appendChild(tdA);
             const tdLP = document.createElement('td'); tdLP.textContent = fmtMoney(o.plannedLabourCost); tr.appendChild(tdLP);
             const tdLA = document.createElement('td'); tdLA.textContent = fmtMoney(o.actualLabourCost); tr.appendChild(tdLA);
-            const tdC = document.createElement('td'); tdC.textContent = fmtMoney(o.costOfGoods); tr.appendChild(tdC);
+            const tdC = document.createElement('td');
+            const cogsInp = document.createElement('input'); cogsInp.type = 'number'; cogsInp.min = '0'; cogsInp.step = '0.01';
+            const optKey = o.optionId + '|' + o.taskId;
+            cogsInp.value = report.costOfGoodsByOption[optKey] || '';
+            cogsInp.addEventListener('change', () => {
+              report.costOfGoodsByOption[optKey] = Number(cogsInp.value) || 0;
+              save(); renderFinancialPage();
+            });
+            tdC.appendChild(cogsInp); tr.appendChild(tdC);
             optTbody.appendChild(tr);
           });
           optTable.appendChild(optTbody);
@@ -6975,8 +6987,7 @@
         const meta = document.createElement('div'); meta.className = 'drill-meta'; meta.id = 'option-meta-' + opt.id;
         const refreshMeta = () => {
           const totalHours = opt.items.reduce((s, i) => s + (Number(i.hours) || 0), 0);
-          const totalCogs = opt.items.reduce((s, i) => s + (Number(i.costOfGoods) || 0), 0);
-          meta.textContent = `${opt.items.length} item${opt.items.length === 1 ? '' : 's'} — ${totalHours}h, ${fmtMoney(totalCogs)} ${expanded ? '▾' : '▸'}`;
+          meta.textContent = `${opt.items.length} item${opt.items.length === 1 ? '' : 's'} — ${totalHours}h ${expanded ? '▾' : '▸'}`;
         };
         refreshMeta();
         row.appendChild(meta);
@@ -7005,7 +7016,7 @@
             panel.appendChild(empty);
           } else {
             const table = document.createElement('table'); table.className = 'editor';
-            table.innerHTML = '<thead><tr><th>Task</th><th>Sub-task name</th><th style="width:80px">Hours</th><th style="width:110px">Cost of goods ($)</th><th></th></tr></thead>';
+            table.innerHTML = '<thead><tr><th>Task</th><th>Sub-task name</th><th style="width:80px">Hours</th><th></th></tr></thead>';
             const tbody = document.createElement('tbody');
             opt.items.forEach(item => {
               const tr = document.createElement('tr');
@@ -7034,13 +7045,6 @@
               hoursI.addEventListener('click', (e) => e.stopPropagation());
               tdHours.appendChild(hoursI); tr.appendChild(tdHours);
 
-              const tdCogs = document.createElement('td');
-              const cogsI = document.createElement('input'); cogsI.type = 'number'; cogsI.min = '0'; cogsI.step = '0.01';
-              cogsI.value = item.costOfGoods || '';
-              cogsI.addEventListener('click', (e) => e.stopPropagation());
-              cogsI.addEventListener('input', () => { item.costOfGoods = Number(cogsI.value) || 0; save(); refreshMeta(); });
-              tdCogs.appendChild(cogsI); tr.appendChild(tdCogs);
-
               const tdDel = document.createElement('td');
               const itemDelBtn = document.createElement('button'); itemDelBtn.className = 'icon ghost'; itemDelBtn.textContent = '✕';
               itemDelBtn.addEventListener('click', (e) => {
@@ -7059,7 +7063,7 @@
           addItemBtn.textContent = '+ Add item';
           addItemBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            opt.items.push({ id: uid('opti'), taskId: null, subtaskName: '', hours: 0, costOfGoods: 0 });
+            opt.items.push({ id: uid('opti'), taskId: null, subtaskName: '', hours: 0 });
             save(); renderJobsPage();
           });
           panel.appendChild(addItemBtn);
@@ -7295,7 +7299,7 @@
   // appliedOptionsForJob), plus a picker to apply another one from the library.
   function renderJobOptionsPanel(container, jr){
     const panel = document.createElement('div'); panel.className = 'panel row-gap';
-    panel.innerHTML = '<h2>Options</h2><div class="hint">Adds a sub-task (with its own hours and cost of goods) to the relevant task above for each item in the option — click one to adjust its hours/cost of goods just for this job (this never touches the option template in the library), or remove it here to pull all of them back out.</div>';
+    panel.innerHTML = '<h2>Options</h2><div class="hint">Adds a sub-task to the relevant task above for each item in the option — click one to adjust its hours just for this job (this never touches the option template in the library), or remove it here to pull all of them back out. Cost of goods for an option is entered when generating a Financial Report, not here.</div>';
 
     const applied = appliedOptionsForJob(jr);
     if (applied.length === 0){
@@ -7321,7 +7325,7 @@
         main.appendChild(sub);
         row.appendChild(main);
         const meta = document.createElement('div'); meta.className = 'drill-meta';
-        meta.textContent = `${o.totalHours}h total, ${fmtMoney(o.totalCostOfGoods)} ${expanded ? '▾' : '▸'}`;
+        meta.textContent = `${o.totalHours}h total ${expanded ? '▾' : '▸'}`;
         row.appendChild(meta);
         const delBtn = document.createElement('button'); delBtn.className = 'icon ghost'; delBtn.textContent = '✕';
         delBtn.title = 'Remove this option from the job — pulls out every sub-task it added.';
@@ -7341,48 +7345,109 @@
         if (expanded){
           // Editing here changes only this job's own copy of the sub-task (created back when the option was
           // added) — the option template in the library above is never touched, same as a job's tasks already
-          // being their own independent copy once created from a template.
+          // being their own independent copy once created from a template. Grouped and collapsed by task, same
+          // as the job's own Tasks table above, rather than one flat list.
           const editPanel = document.createElement('div'); editPanel.className = 'subtask-panel';
-          const table = document.createElement('table'); table.className = 'editor';
-          table.innerHTML = '<thead><tr><th>Task</th><th>Sub-task name</th><th style="width:80px">Hours</th><th style="width:110px">Cost of goods ($)</th><th></th></tr></thead>';
-          const tbody = document.createElement('tbody');
+
+          const byTaskId = new Map();
           o.subtasks.forEach(({ task, subtask }) => {
-            const tr = document.createElement('tr');
-            const tdTask = document.createElement('td'); tdTask.textContent = jobTaskDisplayName(task); tr.appendChild(tdTask);
-
-            const tdName = document.createElement('td');
-            const nameI = document.createElement('input'); nameI.type = 'text'; nameI.value = subtask.name || '';
-            nameI.addEventListener('input', () => { subtask.name = nameI.value; save(); });
-            tdName.appendChild(nameI); tr.appendChild(tdName);
-
-            const tdHours = document.createElement('td');
-            const hoursI = makeHourInput(subtask.standardTime, (val) => {
-              subtask.standardTime = Number(val) || 0; save();
-              const outerHrs = document.getElementById('jobtask-hours-' + task.id);
-              if (outerHrs) outerHrs.textContent = jobTaskSelectedHours(task);
-            });
-            tdHours.appendChild(hoursI); tr.appendChild(tdHours);
-
-            const tdCogs = document.createElement('td');
-            const cogsI = document.createElement('input'); cogsI.type = 'number'; cogsI.min = '0'; cogsI.step = '0.01';
-            cogsI.value = subtask.optionCostOfGoods || '';
-            cogsI.addEventListener('input', () => { subtask.optionCostOfGoods = Number(cogsI.value) || 0; save(); });
-            tdCogs.appendChild(cogsI); tr.appendChild(tdCogs);
-
-            const tdDel = document.createElement('td');
-            const itemDelBtn = document.createElement('button'); itemDelBtn.className = 'icon ghost'; itemDelBtn.textContent = '✕';
-            itemDelBtn.title = 'Remove just this one item — the rest of the option stays applied.';
-            itemDelBtn.addEventListener('click', () => {
-              task.subtasks = task.subtasks.filter(x => x.id !== subtask.id);
-              save(); renderJobsPage(); renderResults();
-            });
-            tdDel.appendChild(itemDelBtn); tr.appendChild(tdDel);
-
-            tbody.appendChild(tr);
+            if (!byTaskId.has(task.id)) byTaskId.set(task.id, { task, items: [] });
+            byTaskId.get(task.id).items.push(subtask);
           });
-          table.appendChild(tbody);
-          editPanel.appendChild(table);
-          editPanel.addEventListener('click', (e) => e.stopPropagation());
+
+          byTaskId.forEach(({ task, items }) => {
+            const taskKey = o.optionId + '|' + task.id;
+            const taskExpanded = optionsAppliedTaskExpanded.has(taskKey);
+            const taskRow = document.createElement('div'); taskRow.className = 'drill-row';
+            taskRow.style.background = 'var(--bg)';
+            const taskMain = document.createElement('div'); taskMain.className = 'drill-main';
+            taskMain.textContent = jobTaskDisplayName(task);
+            taskRow.appendChild(taskMain);
+            const taskMeta = document.createElement('div'); taskMeta.className = 'drill-meta';
+            taskMeta.textContent = `${items.length} sub-task${items.length === 1 ? '' : 's'} ${taskExpanded ? '▾' : '▸'}`;
+            taskRow.appendChild(taskMeta);
+            taskRow.addEventListener('click', () => {
+              if (taskExpanded) optionsAppliedTaskExpanded.delete(taskKey); else optionsAppliedTaskExpanded.add(taskKey);
+              renderJobsPage();
+            });
+            editPanel.appendChild(taskRow);
+
+            if (taskExpanded){
+              const table = document.createElement('table'); table.className = 'editor';
+              table.innerHTML = '<thead><tr><th>Sub-task name</th><th style="width:80px">Hours</th><th></th></tr></thead>';
+              const tbody = document.createElement('tbody');
+              items.forEach(subtask => {
+                const tr = document.createElement('tr');
+                const tdName = document.createElement('td');
+                const nameI = document.createElement('input'); nameI.type = 'text'; nameI.value = subtask.name || '';
+                nameI.addEventListener('click', (e) => e.stopPropagation());
+                nameI.addEventListener('input', () => { subtask.name = nameI.value; save(); });
+                tdName.appendChild(nameI); tr.appendChild(tdName);
+
+                const tdHours = document.createElement('td');
+                const hoursI = makeHourInput(subtask.standardTime, (val) => {
+                  subtask.standardTime = Number(val) || 0; save();
+                  const outerHrs = document.getElementById('jobtask-hours-' + task.id);
+                  if (outerHrs) outerHrs.textContent = jobTaskSelectedHours(task);
+                });
+                hoursI.addEventListener('click', (e) => e.stopPropagation());
+                tdHours.appendChild(hoursI); tr.appendChild(tdHours);
+
+                const tdDel = document.createElement('td');
+                const itemDelBtn = document.createElement('button'); itemDelBtn.className = 'icon ghost'; itemDelBtn.textContent = '✕';
+                itemDelBtn.title = 'Remove just this one sub-task — the rest of the option stays applied.';
+                itemDelBtn.addEventListener('click', (e) => {
+                  e.stopPropagation();
+                  task.subtasks = task.subtasks.filter(x => x.id !== subtask.id);
+                  save(); renderJobsPage(); renderResults();
+                });
+                tdDel.appendChild(itemDelBtn); tr.appendChild(tdDel);
+
+                tbody.appendChild(tr);
+              });
+              table.appendChild(tbody);
+              editPanel.appendChild(table);
+
+              const addSubBtn = document.createElement('button'); addSubBtn.className = 'ghost icon'; addSubBtn.style.marginTop = '8px'; addSubBtn.style.marginBottom = '10px';
+              addSubBtn.textContent = '+ Add sub-task';
+              addSubBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const nextNum = String((task.subtasks.length + 1) * 10);
+                task.subtasks.push({
+                  id: uid('jst'), number: nextNum, name: 'New sub-task', notes: '', standardTime: 0, selected: true,
+                  completed: false, timeLogs: [], timerRunning: false,
+                  fromOptionId: o.optionId, fromOptionName: o.optionName
+                });
+                save(); renderJobsPage(); renderResults();
+              });
+              editPanel.appendChild(addSubBtn);
+            }
+          });
+
+          // Adds this option to a task it doesn't already touch — same tagging as every other item, so it
+          // shows up right alongside the rest next time this panel renders.
+          const addTaskRow = document.createElement('div'); addTaskRow.className = 'field-row'; addTaskRow.style.marginTop = '10px';
+          const addTaskSel = document.createElement('select'); addTaskSel.addEventListener('click', (e) => e.stopPropagation());
+          const addTaskNone = document.createElement('option'); addTaskNone.value = ''; addTaskNone.textContent = '— Pick a task —';
+          addTaskSel.appendChild(addTaskNone);
+          state.tasks.forEach(t => {
+            const opt = document.createElement('option'); opt.value = t.id; opt.textContent = t.name;
+            addTaskSel.appendChild(opt);
+          });
+          addTaskRow.appendChild(addTaskSel);
+          const addTaskBtn = document.createElement('button'); addTaskBtn.className = 'ghost icon';
+          addTaskBtn.textContent = '+ Add task to this option';
+          addTaskBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (!addTaskSel.value){ alert('Pick a task first.'); return; }
+            addOptionToJob(jr, { id: o.optionId, name: o.optionName, items: [{ taskId: addTaskSel.value, subtaskName: 'New sub-task', hours: 0 }] });
+            optionsAppliedTaskExpanded.add(o.optionId + '|' + addTaskSel.value);
+            save(); renderJobsPage(); renderResults();
+          });
+          addTaskRow.appendChild(addTaskBtn);
+          addTaskRow.addEventListener('click', (e) => e.stopPropagation());
+          editPanel.appendChild(addTaskRow);
+
           list.appendChild(editPanel);
         }
       });
@@ -7424,7 +7489,7 @@
       const customBtn = document.createElement('button'); customBtn.className = 'ghost icon';
       customBtn.textContent = '+ Create custom option for this job';
       customBtn.addEventListener('click', () => {
-        customOptionDraft = { name: '', items: [{ id: uid('opti'), taskId: null, subtaskName: '', hours: 0, costOfGoods: 0 }] };
+        customOptionDraft = { name: '', items: [{ id: uid('opti'), taskId: null, subtaskName: '', hours: 0 }] };
         renderJobsPage();
       });
       customWrap.appendChild(customBtn);
@@ -7446,7 +7511,7 @@
       customWrap.appendChild(nameRow);
 
       const table = document.createElement('table'); table.className = 'editor'; table.style.marginTop = '8px';
-      table.innerHTML = '<thead><tr><th>Task</th><th>Sub-task name</th><th style="width:80px">Hours</th><th style="width:110px">Cost of goods ($)</th><th></th></tr></thead>';
+      table.innerHTML = '<thead><tr><th>Task</th><th>Sub-task name</th><th style="width:80px">Hours</th><th></th></tr></thead>';
       const tbody = document.createElement('tbody');
       customOptionDraft.items.forEach(item => {
         const tr = document.createElement('tr');
@@ -7472,12 +7537,6 @@
         const hoursI = makeHourInput(item.hours, (val) => { item.hours = Number(val) || 0; });
         tdHours.appendChild(hoursI); tr.appendChild(tdHours);
 
-        const tdCogs = document.createElement('td');
-        const cogsI = document.createElement('input'); cogsI.type = 'number'; cogsI.min = '0'; cogsI.step = '0.01';
-        cogsI.value = item.costOfGoods || '';
-        cogsI.addEventListener('input', () => { item.costOfGoods = Number(cogsI.value) || 0; });
-        tdCogs.appendChild(cogsI); tr.appendChild(tdCogs);
-
         const tdDel = document.createElement('td');
         const delItemBtn = document.createElement('button'); delItemBtn.className = 'icon ghost'; delItemBtn.textContent = '✕';
         delItemBtn.addEventListener('click', () => {
@@ -7494,7 +7553,7 @@
       const addItemBtn = document.createElement('button'); addItemBtn.className = 'ghost icon'; addItemBtn.style.marginTop = '8px';
       addItemBtn.textContent = '+ Add item';
       addItemBtn.addEventListener('click', () => {
-        customOptionDraft.items.push({ id: uid('opti'), taskId: null, subtaskName: '', hours: 0, costOfGoods: 0 });
+        customOptionDraft.items.push({ id: uid('opti'), taskId: null, subtaskName: '', hours: 0 });
         renderJobsPage();
       });
       customWrap.appendChild(addItemBtn);
@@ -7549,7 +7608,7 @@
       tdName.appendChild(nameInp);
       if (st.fromOptionId){
         const optTag = document.createElement('div'); optTag.className = 'auto-tag';
-        optTag.textContent = `via option: ${st.fromOptionName || '(unnamed)'} — ${fmtMoney(st.optionCostOfGoods || 0)} cost of goods`;
+        optTag.textContent = `via option: ${st.fromOptionName || '(unnamed)'}`;
         tdName.appendChild(optTag);
       }
       tr.appendChild(tdName);
