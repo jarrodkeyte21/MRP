@@ -1194,7 +1194,10 @@
       if (r.sellPrice === undefined) r.sellPrice = 0;
     });
     if (!state.optionTemplates) state.optionTemplates = [];
-    state.optionTemplates.forEach(o => { if (!Array.isArray(o.items)) o.items = []; });
+    state.optionTemplates.forEach(o => {
+      if (!Array.isArray(o.items)) o.items = [];
+      if (!Array.isArray(o.applicableMachineTypes)) o.applicableMachineTypes = [];
+    });
     if (state.meta.lastCheckedDate === undefined) state.meta.lastCheckedDate = null;
     // Sign-off is just a correction layered on top of the simulation now (see runSchedule), not a gate on the
     // start date — so the start date always rolls forward to today, every load, regardless of sign-off history.
@@ -1284,6 +1287,9 @@
           });
           if (st.timerRunning === undefined) st.timerRunning = false;
         });
+        // Sub-tasks always sit in number order on the task, in every job — not just right after an edit (e.g.
+        // an option applied out of order, or a CSV import that wasn't already sorted).
+        resortSubtasksByNumber(t);
       });
       // Drop dependency references to sibling tasks that no longer exist and self-references.
       const ids = new Set(tasks.map(t => t.id));
@@ -7105,6 +7111,39 @@
           });
           panel.appendChild(importBtn);
 
+          const machineTitle = document.createElement('div'); machineTitle.style.marginTop = '14px'; machineTitle.style.fontWeight = '700';
+          machineTitle.textContent = 'Applies to machine types';
+          panel.appendChild(machineTitle);
+          const machineHint = document.createElement('div'); machineHint.className = 'hint';
+          machineHint.textContent = 'Leave all unchecked to allow this option on every machine type — check one or more to restrict which jobs it can be applied to.';
+          panel.appendChild(machineHint);
+          if (state.jobTemplates.length === 0){
+            const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '4px';
+            empty.textContent = 'No machine templates yet.';
+            panel.appendChild(empty);
+          } else {
+            const machineWrap = document.createElement('div'); machineWrap.className = 'dep-list'; machineWrap.style.marginTop = '4px';
+            state.jobTemplates.forEach(jtm => {
+              const label = document.createElement('label'); label.className = 'dep-item';
+              const cb = document.createElement('input'); cb.type = 'checkbox';
+              cb.checked = opt.applicableMachineTypes.includes(jtm.name);
+              cb.addEventListener('click', (e) => e.stopPropagation());
+              cb.addEventListener('change', () => {
+                if (cb.checked){
+                  if (!opt.applicableMachineTypes.includes(jtm.name)) opt.applicableMachineTypes.push(jtm.name);
+                } else {
+                  opt.applicableMachineTypes = opt.applicableMachineTypes.filter(n => n !== jtm.name);
+                }
+                save();
+              });
+              label.appendChild(cb);
+              const span = document.createElement('span'); span.textContent = jtm.name || '(unnamed template)';
+              label.appendChild(span);
+              machineWrap.appendChild(label);
+            });
+            panel.appendChild(machineWrap);
+          }
+
           panel.addEventListener('click', (e) => e.stopPropagation());
           list.appendChild(panel);
         }
@@ -7115,7 +7154,7 @@
     const addOptBtn = document.createElement('button'); addOptBtn.className = 'ghost icon'; addOptBtn.style.marginTop = '12px';
     addOptBtn.textContent = '+ Add option';
     addOptBtn.addEventListener('click', () => {
-      const opt = { id: uid('opt'), name: 'New option', items: [] };
+      const opt = { id: uid('opt'), name: 'New option', items: [], applicableMachineTypes: [] };
       state.optionTemplates.push(opt);
       optionsExpanded.add(opt.id);
       save(); renderJobsPage();
@@ -7379,7 +7418,8 @@
             taskMain.textContent = jobTaskDisplayName(task);
             taskRow.appendChild(taskMain);
             const taskMeta = document.createElement('div'); taskMeta.className = 'drill-meta';
-            taskMeta.textContent = `${items.length} sub-task${items.length === 1 ? '' : 's'} ${taskExpanded ? '▾' : '▸'}`;
+            const taskItemsHours = items.reduce((sum, st) => sum + (Number(st.standardTime) || 0), 0);
+            taskMeta.textContent = `${items.length} sub-task${items.length === 1 ? '' : 's'} — ${taskItemsHours}h ${taskExpanded ? '▾' : '▸'}`;
             taskRow.appendChild(taskMeta);
             taskRow.addEventListener('click', () => {
               if (taskExpanded) optionsAppliedTaskExpanded.delete(taskKey); else optionsAppliedTaskExpanded.add(taskKey);
@@ -7485,15 +7525,22 @@
       panel.appendChild(list);
     }
 
+    // Only options that either apply to every machine type (none checked) or explicitly list this job's
+    // machine type — a T11-only option shouldn't be pickable for a TFS4 job.
+    const applicableOptions = state.optionTemplates.filter(opt =>
+      opt.applicableMachineTypes.length === 0 || opt.applicableMachineTypes.includes(jr.machineType)
+    );
+
     const addRow = document.createElement('div'); addRow.className = 'field-row'; addRow.style.marginTop = '12px';
     const sel = document.createElement('select');
-    if (state.optionTemplates.length === 0){
-      const o = document.createElement('option'); o.value = ''; o.textContent = 'No options in the library yet';
+    if (applicableOptions.length === 0){
+      const o = document.createElement('option'); o.value = '';
+      o.textContent = state.optionTemplates.length === 0 ? 'No options in the library yet' : `No options apply to ${jr.machineType || 'this machine type'}`;
       sel.appendChild(o); sel.disabled = true;
     } else {
       const noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '— Pick an option —';
       sel.appendChild(noneOpt);
-      state.optionTemplates.forEach(opt => {
+      applicableOptions.forEach(opt => {
         const o = document.createElement('option'); o.value = opt.id; o.textContent = opt.name || '(unnamed option)';
         sel.appendChild(o);
       });
@@ -7501,7 +7548,7 @@
     addRow.appendChild(sel);
     const addBtn = document.createElement('button'); addBtn.className = 'ghost icon';
     addBtn.textContent = '+ Add option to this job';
-    addBtn.disabled = state.optionTemplates.length === 0;
+    addBtn.disabled = applicableOptions.length === 0;
     addBtn.addEventListener('click', () => {
       const opt = state.optionTemplates.find(x => x.id === sel.value);
       if (!opt){ alert('Pick an option first.'); return; }
