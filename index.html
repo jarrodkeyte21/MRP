@@ -5680,14 +5680,20 @@
         tr.appendChild(tdHours);
 
         const tdDel = document.createElement('td');
-        const delBtn = document.createElement('button'); delBtn.className = 'icon ghost'; delBtn.textContent = '✕';
-        delBtn.title = 'Remove this session';
-        delBtn.addEventListener('click', () => {
-          obj.timeLogs = obj.timeLogs.filter(x => x.id !== tl.id);
-          if (obj.timerRunning && !obj.timeLogs.some(x => !x.stopTime)) obj.timerRunning = false;
-          save(); renderJobCardsLivePage();
-        });
-        tdDel.appendChild(delBtn); tr.appendChild(tdDel);
+        // Floor can only remove their own sessions — not a co-worker's clock-in on a shared-clock task or a
+        // session someone else logged against this same sub-task. Managers still see and can remove any of them.
+        const canDelete = !isFloor || tl.personId === (currentProfile && currentProfile.person_id);
+        if (canDelete){
+          const delBtn = document.createElement('button'); delBtn.className = 'icon ghost'; delBtn.textContent = '✕';
+          delBtn.title = 'Remove this session';
+          delBtn.addEventListener('click', () => {
+            obj.timeLogs = obj.timeLogs.filter(x => x.id !== tl.id);
+            if (obj.timerRunning && !obj.timeLogs.some(x => !x.stopTime)) obj.timerRunning = false;
+            save(); renderJobCardsLivePage();
+          });
+          tdDel.appendChild(delBtn);
+        }
+        tr.appendChild(tdDel);
 
         tbody.appendChild(tr);
       });
