@@ -6804,89 +6804,76 @@
     container.appendChild(panel);
   }
 
-  function renderAdHocReportSection(container){
-    const logged = state.adHocCards.filter(c => (c.timeLogs || []).length > 0);
-    if (logged.length === 0) return;
+  // Which month a clock-like report entry (Factory Maintenance, Lost Time, Ad-hoc work) is filtered to —
+  // keyed by the same key used in the Reports list, '' meaning "all months". Persists across renders.
+  let reportsMonthFilter = {};
 
-    const panel = document.createElement('div'); panel.className = 'panel'; panel.style.marginTop = '16px';
-    panel.innerHTML = '<h2>Ad-hoc work</h2><div class="hint">Time logged against ad-hoc tasks — not tied to any job\'s task/sub-task setup.</div>';
+  // Shared detail view for anything that's a flat list of ad-hoc entries with timeLogs rather than a real
+  // job's task/sub-task tree (Factory Maintenance, Lost Time, everything-else Ad-hoc work) — sits in the same
+  // Reports list as real jobs (see renderReportsPage) instead of being pinned as its own always-visible
+  // section, and offers a month filter since there's no natural "one job" scope to bound it otherwise.
+  function renderClockLikeReportDetail(container, key, label, entries){
+    const panel = document.createElement('div'); panel.className = 'panel'; panel.style.marginTop = '10px';
+    panel.innerHTML = `<h2>${label} — Report</h2>`;
 
-    const table = document.createElement('table'); table.className = 'editor'; table.style.marginTop = '10px';
-    table.innerHTML = '<thead><tr><th>Type</th><th>Job #</th><th>Description</th><th>Date</th><th>By</th><th style="width:90px">Start</th><th style="width:90px">Stop</th><th style="width:70px">Hours</th></tr></thead>';
-    const tbody = document.createElement('tbody');
-    let total = 0;
-    logged.forEach(c => {
-      const person = state.people.find(p => p.id === c.personId);
-      const build = c.buildId ? state.builds.find(b => b.id === c.buildId) : null;
-      const jobNum = build ? effectiveBuildData(build).jobNumber : (c.jobNumber || '—');
-      [...c.timeLogs].sort((a, b) => {
-        const ad = a.date || '', bd = b.date || '';
-        if (ad !== bd) return ad < bd ? -1 : 1;
-        return (a.startTime || '') < (b.startTime || '') ? -1 : 1;
-      }).forEach(tl => {
-        const hrs = Math.round(logEntryHours(tl, c) * 100) / 100;
-        total += hrs;
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${adHocCardKindLabel(c.kind)}</td><td>${jobNum || '—'}</td><td>${c.description || '(no description)'}</td><td>${tl.date ? fmtDateLong(tl.date) : '—'}</td><td>${person ? person.name : '(unassigned)'}</td><td>${tl.startTime || '—'}</td><td>${tl.stopTime || '—'}</td><td>${hrs}h</td>`;
-        tbody.appendChild(tr);
-      });
+    const allLogs = [];
+    entries.forEach(c => (c.timeLogs || []).forEach(tl => { if (tl.date) allLogs.push({ c, tl }); }));
+    if (!allLogs.length){
+      const empty = document.createElement('div'); empty.className = 'dep-empty';
+      empty.textContent = `No time logged for ${label} yet.`;
+      panel.appendChild(empty);
+      container.appendChild(panel);
+      return;
+    }
+
+    const months = Array.from(new Set(allLogs.map(x => x.tl.date.slice(0, 7)))).sort().reverse();
+    const filterRow = document.createElement('div'); filterRow.className = 'field-row'; filterRow.style.marginTop = '6px';
+    const flabel = document.createElement('label'); flabel.textContent = 'Month';
+    filterRow.appendChild(flabel);
+    const sel = document.createElement('select');
+    const allOpt = document.createElement('option'); allOpt.value = ''; allOpt.textContent = 'All months';
+    sel.appendChild(allOpt);
+    months.forEach(mk => {
+      const [y, m] = mk.split('-').map(Number);
+      const opt = document.createElement('option'); opt.value = mk; opt.textContent = MONTH_NAMES[m - 1] + ' ' + y;
+      if ((reportsMonthFilter[key] || '') === mk) opt.selected = true;
+      sel.appendChild(opt);
     });
-    table.appendChild(tbody);
-    panel.appendChild(table);
+    sel.addEventListener('change', () => { reportsMonthFilter[key] = sel.value; renderReportsPage(); });
+    filterRow.appendChild(sel);
+    panel.appendChild(filterRow);
 
-    total = Math.round(total * 100) / 100;
-    const totalRow = document.createElement('div'); totalRow.style.marginTop = '10px'; totalRow.style.fontWeight = '700';
-    totalRow.textContent = `Total ad-hoc time used: ${total}h`;
-    panel.appendChild(totalRow);
+    const activeMonth = reportsMonthFilter[key] || '';
+    const filteredLogs = activeMonth ? allLogs.filter(x => x.tl.date.slice(0, 7) === activeMonth) : allLogs;
 
-    container.appendChild(panel);
-  }
-
-  // Time clocked against the fixed Factory Maintenance / Lost Time job, grouped by calendar month so each
-  // month reads as its own fresh total (per the "resets every month" requirement) without ever deleting
-  // anything — older months just sit further down, most recent first. Factory Maintenance and Lost Time are
-  // separate tasks (separate dedicated Start/Stop controls — see renderFixedClockControl) and get their own
-  // report section each, rather than one combined total.
-  function renderFixedClockReportSection(container, title, hint, matchesEntry){
-    const entries = state.adHocCards.filter(c => matchesEntry(c) && (c.timeLogs || []).length);
-    if (!entries.length) return;
-
-    const byMonth = new Map(); // 'YYYY-MM' -> Map(personId -> hours)
-    entries.forEach(c => {
-      (c.timeLogs || []).forEach(tl => {
-        if (!tl.date) return;
-        const hrs = logEntryHours(tl, c);
-        if (hrs <= 0) return;
-        const monthKey = tl.date.slice(0, 7);
-        if (!byMonth.has(monthKey)) byMonth.set(monthKey, new Map());
-        const perPerson = byMonth.get(monthKey);
-        perPerson.set(c.personId, (perPerson.get(c.personId) || 0) + hrs);
-      });
+    const byMonth = new Map();
+    filteredLogs.forEach(x => {
+      const mk = x.tl.date.slice(0, 7);
+      if (!byMonth.has(mk)) byMonth.set(mk, []);
+      byMonth.get(mk).push(x);
     });
-    if (!byMonth.size) return;
 
-    const panel = document.createElement('div'); panel.className = 'panel'; panel.style.marginTop = '16px';
-    panel.innerHTML = `<h2>${title}</h2><div class="hint">${hint}</div>`;
-
-    Array.from(byMonth.keys()).sort().reverse().forEach(monthKey => {
-      const [y, m] = monthKey.split('-').map(Number);
+    Array.from(byMonth.keys()).sort().reverse().forEach(mk => {
+      const [y, m] = mk.split('-').map(Number);
       const monthLabel = MONTH_NAMES[m - 1] + ' ' + y;
       const monthHeading = document.createElement('div'); monthHeading.style.marginTop = '14px'; monthHeading.style.fontWeight = '700';
       monthHeading.textContent = monthLabel;
       panel.appendChild(monthHeading);
 
       const table = document.createElement('table'); table.className = 'editor'; table.style.marginTop = '6px';
-      table.innerHTML = '<thead><tr><th>Person</th><th style="width:90px">Hours</th></tr></thead>';
+      table.innerHTML = '<thead><tr><th>Date</th><th>Person</th><th>Description</th><th style="width:90px">Start</th><th style="width:90px">Stop</th><th style="width:70px">Hours</th></tr></thead>';
       const tbody = document.createElement('tbody');
       let monthTotal = 0;
-      Array.from(byMonth.get(monthKey).entries()).sort((a, b) => b[1] - a[1]).forEach(([personId, hrs]) => {
-        const person = state.people.find(p => p.id === personId);
-        const rounded = Math.round(hrs * 100) / 100;
-        monthTotal += rounded;
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${person ? person.name : '(unassigned)'}</td><td>${rounded}h</td>`;
-        tbody.appendChild(tr);
-      });
+      byMonth.get(mk)
+        .sort((a, b) => (a.tl.date + (a.tl.startTime || '')) < (b.tl.date + (b.tl.startTime || '')) ? -1 : 1)
+        .forEach(({ c, tl }) => {
+          const hrs = Math.round(logEntryHours(tl, c) * 100) / 100;
+          monthTotal += hrs;
+          const person = state.people.find(p => p.id === tl.personId);
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${fmtDateLong(tl.date)}</td><td>${person ? person.name : '(unassigned)'}</td><td>${c.description || adHocCardKindLabel(c.kind)}</td><td>${tl.startTime || '—'}</td><td>${tl.stopTime || '—'}</td><td>${hrs}h</td>`;
+          tbody.appendChild(tr);
+        });
       table.appendChild(tbody);
       panel.appendChild(table);
 
@@ -6896,6 +6883,20 @@
     });
 
     container.appendChild(panel);
+  }
+
+  // Most recent activity date across a set of ad-hoc entries — same purpose as jobReportAnchorDate, for
+  // sorting the Factory Maintenance / Lost Time / Ad-hoc work rows into the same newest-first list as jobs.
+  function clockLikeAnchorDate(entries){
+    let latest = null;
+    entries.forEach(c => (c.timeLogs || []).forEach(tl => { if (tl.date && (!latest || tl.date > latest)) latest = tl.date; }));
+    return latest;
+  }
+
+  function clockLikeTotalHours(entries){
+    let total = 0;
+    entries.forEach(c => (c.timeLogs || []).forEach(tl => { total += logEntryHours(tl, c); }));
+    return Math.round(total * 100) / 100;
   }
 
   // A one-click, self-contained demo job (id-guarded so clicking twice doesn't duplicate it) — shows what a
@@ -7359,7 +7360,7 @@
     container.innerHTML = '';
 
     const panel = document.createElement('div'); panel.className = 'panel';
-    panel.innerHTML = '<h2>Reports</h2><div class="hint">Jobs newest to oldest — click one to see its full task and sub-task time breakdown.</div>';
+    panel.innerHTML = '<h2>Reports</h2><div class="hint">Jobs newest to oldest, alongside Factory Maintenance / Lost Time / Ad-hoc work — click one to see its full time breakdown (a month filter is available on the non-job ones).</div>';
 
     const exampleBtn = document.createElement('button'); exampleBtn.className = 'ghost icon'; exampleBtn.style.marginTop = '8px';
     exampleBtn.textContent = '+ Add example job (5555) to see a sample report';
@@ -7367,39 +7368,60 @@
     panel.appendChild(exampleBtn);
 
     const jobs = state.jobRecords.map(jr => ({
-      jr, date: jobReportAnchorDate(jr), build: state.builds.find(b => b.jobRecordId === jr.id)
-    })).sort((a, b) => {
+      kind: 'job', key: jr.id, jr, date: jobReportAnchorDate(jr), build: state.builds.find(b => b.jobRecordId === jr.id)
+    }));
+
+    // Factory Maintenance, Lost Time, and everything-else Ad-hoc work sit in this same list, sorted alongside
+    // real jobs by their own most recent activity, instead of being pinned as their own always-visible
+    // sections underneath — "just another row" here, same as any job.
+    const fixedBuild = state.builds.find(b => b.jobRecordId === FACTORY_MAINT_JOB_ID);
+    const isDedicatedLostTime = c => c.kind === 'lostTime' && fixedBuild && c.buildId === fixedBuild.id && !c.taskId;
+    const fmEntries = state.adHocCards.filter(c => c.kind === 'factoryMaintenance' && (c.timeLogs || []).length);
+    const ltEntries = state.adHocCards.filter(c => isDedicatedLostTime(c) && (c.timeLogs || []).length);
+    const otherAdHocEntries = state.adHocCards.filter(c => c.kind !== 'factoryMaintenance' && !isDedicatedLostTime(c) && (c.timeLogs || []).length);
+    const clockLikeRows = [
+      { kind: 'clock', key: 'clock-fm', label: 'Factory Maintenance', entries: fmEntries },
+      { kind: 'clock', key: 'clock-lt', label: 'Lost Time', entries: ltEntries },
+      { kind: 'clock', key: 'clock-adhoc', label: 'Ad-hoc work', entries: otherAdHocEntries }
+    ].filter(r => r.entries.length).map(r => ({ ...r, date: clockLikeAnchorDate(r.entries) }));
+
+    const allRows = [...jobs, ...clockLikeRows].sort((a, b) => {
       if (a.date && b.date) return a.date < b.date ? 1 : a.date > b.date ? -1 : 0;
       if (a.date) return -1;
       if (b.date) return 1;
       return 0;
     });
 
-    if (jobs.length === 0){
+    if (allRows.length === 0){
       const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
       empty.textContent = 'No jobs yet — add them in the Jobs tab.';
       panel.appendChild(empty);
     } else {
       const list = document.createElement('div'); list.className = 'drill-list'; list.style.marginTop = '10px';
-      jobs.forEach(({ jr, date, build }) => {
+      allRows.forEach(r => {
         const row = document.createElement('div'); row.className = 'drill-row';
         const main = document.createElement('div'); main.className = 'drill-main';
-        main.textContent = jr.jobNumber || '(no job #)';
+        main.textContent = r.kind === 'job' ? (r.jr.jobNumber || '(no job #)') : r.label;
         row.appendChild(main);
-        const expanded = reportsExpanded.has(jr.id);
-        const statusLabel = build ? (build.status === 'complete' ? 'Complete' : (build.status || 'scheduled')) : 'No build';
+        const expanded = reportsExpanded.has(r.key);
         const meta = document.createElement('div'); meta.className = 'drill-meta';
-        meta.textContent = `${date ? fmtDateLong(date) : 'No date'} · ${statusLabel} · ${jobTotalLoggedHours(jr)}h logged ${expanded ? '▾' : '▸'}`;
+        if (r.kind === 'job'){
+          const statusLabel = r.build ? (r.build.status === 'complete' ? 'Complete' : (r.build.status || 'scheduled')) : 'No build';
+          meta.textContent = `${r.date ? fmtDateLong(r.date) : 'No date'} · ${statusLabel} · ${jobTotalLoggedHours(r.jr)}h logged ${expanded ? '▾' : '▸'}`;
+        } else {
+          meta.textContent = `${r.date ? fmtDateLong(r.date) : 'No date'} · ${clockLikeTotalHours(r.entries)}h logged ${expanded ? '▾' : '▸'}`;
+        }
         row.appendChild(meta);
         row.addEventListener('click', () => {
-          if (expanded) reportsExpanded.delete(jr.id); else reportsExpanded.add(jr.id);
+          if (expanded) reportsExpanded.delete(r.key); else reportsExpanded.add(r.key);
           renderReportsPage();
         });
         list.appendChild(row);
 
         if (expanded){
           const wrap = document.createElement('div'); wrap.style.padding = '4px 6px 16px 20px';
-          renderJobReport(wrap, jr);
+          if (r.kind === 'job') renderJobReport(wrap, r.jr);
+          else renderClockLikeReportDetail(wrap, r.key, r.label, r.entries);
           list.appendChild(wrap);
         }
       });
@@ -7407,12 +7429,6 @@
     }
 
     container.appendChild(panel);
-    renderFixedClockReportSection(container, 'Factory Maintenance', 'Time clocked from the dedicated Start/Stop control on every job card, grouped by month — each month starts fresh; nothing is ever deleted, so past months stay here to look back on.', c => c.kind === 'factoryMaintenance');
-    {
-      const fixedBuild = state.builds.find(b => b.jobRecordId === FACTORY_MAINT_JOB_ID);
-      renderFixedClockReportSection(container, 'Lost Time', 'Time clocked from the dedicated Lost Time Start/Stop control on every job card, grouped by month — each month starts fresh; nothing is ever deleted, so past months stay here to look back on.', c => c.kind === 'lostTime' && fixedBuild && c.buildId === fixedBuild.id && !c.taskId);
-    }
-    renderAdHocReportSection(container);
   }
 
   // Shared checkbox-list builder for a person's shop-task competencies — used both for an existing person's
