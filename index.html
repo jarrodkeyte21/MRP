@@ -6575,58 +6575,82 @@
   }
 
   let archiveExpanded = new Set();
-  // 'job' (default, as before) lists one row per job/task card under each date. 'person' regroups the same
-  // data by who did it, one row per person per date — "as their job card was on that day" — instead of one
-  // row per job.
-  let archiveViewMode = 'job';
+  // 'person' (default) lists one row per person per date — "as their job card was on that day". 'job' lists
+  // one row per job/task card under each date instead.
+  let archiveViewMode = 'person';
+
+  // Which cards' session-level breakdown is expanded — keyed date|buildId|taskId, independent of archiveExpanded
+  // (which card is open at all) so switching between Job card / Person view doesn't reset it.
+  let archiveSessionsExpanded = new Set();
 
   // A simplified, read-only report of what actually happened on this one card that day — not the live,
   // editable Job Card (Start/Stop, ticking checkboxes, etc.), which doesn't make sense for history anyway
   // since a past date has no "live" schedule allocation to hang a checklist window off (see archiveCardsForDate).
-  // Just: which sub-tasks had real hours that day, every session logged against them, and the sign-off state.
+  // Every session that day is joined into one clocked total for the task by default — individual sub-tasks and
+  // sessions sit behind "Detail view" instead of always being shown.
   function renderArchiveCardReport(container, c, date){
     const detail = document.createElement('div'); detail.className = 'signoff-row-detail';
     const raw = state.builds.find(b => b.id === c.buildId);
     const jrTask = jobCardSourceTask(raw, c.taskId);
     const signedRec = (state.actuals[date] && state.actuals[date][c.buildId]) ? state.actuals[date][c.buildId][c.taskId] : null;
     const allSubtasks = jrTask ? jrTask.subtasks.filter(st => st.selected) : [];
-
     const activeSubtasks = allSubtasks.filter(st =>
       (st.timeLogs || []).some(tl => tl.date === date) || (st.manualAdds || []).some(m => m.date === date));
-    if (activeSubtasks.length){
-      const table = document.createElement('table'); table.className = 'editor'; table.style.marginTop = '8px';
-      table.innerHTML = '<thead><tr><th>Sub-task</th><th style="width:80px">Hours used</th><th style="width:80px">Completed</th></tr></thead>';
-      const tbody = document.createElement('tbody');
-      activeSubtasks.forEach(st => {
-        const usedThatDay = (st.timeLogs || []).filter(tl => tl.date === date).reduce((s, tl) => s + logEntryHours(tl, st), 0);
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${(st.number ? st.number + ' — ' : '') + st.name}</td><td>${Math.round(usedThatDay * 100) / 100}h</td><td>${st.completed ? '✓' : '—'}</td>`;
-        tbody.appendChild(tr);
-      });
-      table.appendChild(tbody);
-      detail.appendChild(table);
-    }
-
     const sessions = [];
     allSubtasks.forEach(st => (st.timeLogs || []).forEach(tl => { if (tl.date === date) sessions.push({ st, tl }); }));
-    if (sessions.length){
-      const sessHeading = document.createElement('div'); sessHeading.style.marginTop = '10px'; sessHeading.style.fontWeight = '700';
-      sessHeading.textContent = 'Sessions';
-      detail.appendChild(sessHeading);
-      const table2 = document.createElement('table'); table2.className = 'editor'; table2.style.marginTop = '4px';
-      table2.innerHTML = '<thead><tr><th>Sub-task</th><th>Who</th><th style="width:80px">Start</th><th style="width:80px">Stop</th><th style="width:70px">Hours</th></tr></thead>';
-      const tbody2 = document.createElement('tbody');
-      sessions
-        .sort((a, b) => (a.tl.startTime || '') < (b.tl.startTime || '') ? -1 : 1)
-        .forEach(({ st, tl }) => {
-          const person = state.people.find(p => p.id === tl.personId);
-          const hrs = Math.round(logEntryHours(tl, st) * 100) / 100;
+    const totalClocked = sessions.reduce((s, { st, tl }) => s + logEntryHours(tl, st), 0);
+
+    const totalLine = document.createElement('div'); totalLine.style.marginTop = '6px'; totalLine.style.fontWeight = '700';
+    totalLine.textContent = `${c.taskName}: ${Math.round(totalClocked * 100) / 100}h clocked`;
+    detail.appendChild(totalLine);
+
+    const sessKey = date + '|' + c.buildId + '|' + c.taskId;
+    const sessExpanded = archiveSessionsExpanded.has(sessKey);
+    if (activeSubtasks.length || sessions.length){
+      const detailBtn = document.createElement('button'); detailBtn.className = 'ghost icon'; detailBtn.style.marginTop = '6px';
+      detailBtn.textContent = (sessExpanded ? '▾' : '▸') + ' Detail view';
+      detailBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (sessExpanded) archiveSessionsExpanded.delete(sessKey); else archiveSessionsExpanded.add(sessKey);
+        renderArchivePage();
+      });
+      detail.appendChild(detailBtn);
+    }
+
+    if (sessExpanded){
+      if (activeSubtasks.length){
+        const table = document.createElement('table'); table.className = 'editor'; table.style.marginTop = '8px';
+        table.innerHTML = '<thead><tr><th>Sub-task</th><th style="width:80px">Hours used</th><th style="width:80px">Completed</th></tr></thead>';
+        const tbody = document.createElement('tbody');
+        activeSubtasks.forEach(st => {
+          const usedThatDay = (st.timeLogs || []).filter(tl => tl.date === date).reduce((s, tl) => s + logEntryHours(tl, st), 0);
           const tr = document.createElement('tr');
-          tr.innerHTML = `<td>${st.name}</td><td>${person ? person.name : '(unassigned)'}</td><td>${tl.startTime || '—'}</td><td>${tl.stopTime || '—'}</td><td>${hrs}h</td>`;
-          tbody2.appendChild(tr);
+          tr.innerHTML = `<td>${(st.number ? st.number + ' — ' : '') + st.name}</td><td>${Math.round(usedThatDay * 100) / 100}h</td><td>${st.completed ? '✓' : '—'}</td>`;
+          tbody.appendChild(tr);
         });
-      table2.appendChild(tbody2);
-      detail.appendChild(table2);
+        table.appendChild(tbody);
+        detail.appendChild(table);
+      }
+
+      if (sessions.length){
+        const sessHeading = document.createElement('div'); sessHeading.style.marginTop = '10px'; sessHeading.style.fontWeight = '700';
+        sessHeading.textContent = 'Sessions';
+        detail.appendChild(sessHeading);
+        const table2 = document.createElement('table'); table2.className = 'editor'; table2.style.marginTop = '4px';
+        table2.innerHTML = '<thead><tr><th>Sub-task</th><th>Who</th><th style="width:80px">Start</th><th style="width:80px">Stop</th><th style="width:70px">Hours</th></tr></thead>';
+        const tbody2 = document.createElement('tbody');
+        sessions
+          .sort((a, b) => (a.tl.startTime || '') < (b.tl.startTime || '') ? -1 : 1)
+          .forEach(({ st, tl }) => {
+            const person = state.people.find(p => p.id === tl.personId);
+            const hrs = Math.round(logEntryHours(tl, st) * 100) / 100;
+            const tr = document.createElement('tr');
+            tr.innerHTML = `<td>${st.name}</td><td>${person ? person.name : '(unassigned)'}</td><td>${tl.startTime || '—'}</td><td>${tl.stopTime || '—'}</td><td>${hrs}h</td>`;
+            tbody2.appendChild(tr);
+          });
+        table2.appendChild(tbody2);
+        detail.appendChild(table2);
+      }
     }
 
     if (!activeSubtasks.length && !sessions.length){
@@ -6690,7 +6714,7 @@
     const viewLabel = document.createElement('label'); viewLabel.textContent = 'Archive by';
     viewRow.appendChild(viewLabel);
     const byJobBtn = document.createElement('button'); byJobBtn.className = archiveViewMode === 'job' ? 'primary' : 'ghost';
-    byJobBtn.textContent = 'Job card';
+    byJobBtn.textContent = 'Job';
     byJobBtn.addEventListener('click', () => { archiveViewMode = 'job'; renderArchivePage(); });
     viewRow.appendChild(byJobBtn);
     const byPersonBtn = document.createElement('button'); byPersonBtn.className = archiveViewMode === 'person' ? 'primary' : 'ghost';
