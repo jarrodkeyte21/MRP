@@ -6128,18 +6128,48 @@
 
       byTask.forEach((items, taskId) => {
         const task = state.tasks.find(t => t.id === taskId);
-        const taskNameEl = document.createElement('div'); taskNameEl.className = 'taskcard-taskname'; taskNameEl.style.marginTop = '8px';
+        const taskNameRow = document.createElement('div'); taskNameRow.style.display = 'flex'; taskNameRow.style.alignItems = 'center'; taskNameRow.style.justifyContent = 'space-between'; taskNameRow.style.gap = '10px'; taskNameRow.style.marginTop = '8px';
+        const taskNameEl = document.createElement('div'); taskNameEl.className = 'taskcard-taskname'; taskNameEl.style.marginTop = '0';
         taskNameEl.textContent = task ? task.name : '(task)';
-        cardPanel.appendChild(taskNameEl);
+        taskNameRow.appendChild(taskNameEl);
+        // Same "+ Rework" a real/pulled task card gets — was missing here entirely, which made it look like
+        // only the first (real) card on the day had rework available at all.
+        const reworkBtn = document.createElement('button'); reworkBtn.className = 'btn-lg ghost'; reworkBtn.style.flexShrink = '0';
+        reworkBtn.textContent = '+ Rework';
+        reworkBtn.title = 'Log rework hours against this same job/task.';
+        reworkBtn.addEventListener('click', () => {
+          state.adHocCards.push({
+            id: uid('adhoc'), personId: person.id, date,
+            description: '', note: '',
+            buildId, taskId, kind: 'rework',
+            jobNumber: '', hours: 1, completed: false, timeLogs: [], timerRunning: false
+          });
+          save(); renderJobCardsLivePage();
+        });
+        taskNameRow.appendChild(reworkBtn);
+        cardPanel.appendChild(taskNameRow);
+
+        // Rework already logged against this exact job/task rides along at the bottom of its checklist, same
+        // as a real task card, instead of falling through to the generic ad-hoc list further down the page.
+        const reworkRows = adHoc.filter(rw => rw.kind === 'rework' && rw.buildId === buildId && rw.taskId === taskId).map(rw => {
+          attachedAdHocIds.add(rw.id);
+          return {
+            obj: rw, number: '', name: rw.description || adHocCardKindLabel(rw.kind), notes: rw.note, time: rw.hours + 'h',
+            onNoteChange: (val) => { rw.note = val; save(); },
+            onDelete: () => { state.adHocCards = state.adHocCards.filter(x => x.id !== rw.id); save(); renderJobCardsLivePage(); }
+          };
+        });
+
         subtaskHoursTotal += items.reduce((sum, m) => sum + (Number(m.subtask.standardTime) || 0), 0);
-        cardPanel.appendChild(renderSubtaskTimerTable(items.map(m => ({
+        const itemRows = items.map(m => ({
           obj: m.subtask, number: m.subtask.number, name: m.subtask.name, notes: m.subtask.notes, time: m.subtask.standardTime + 'h',
           prefix: m.addedBy ? `Added by ${m.addedBy}` : 'Added manually',
           onDelete: () => {
             m.subtask.manualAdds = (m.subtask.manualAdds || []).filter(x => x.id !== m.manualAddId);
             save(); renderJobCardsLivePage();
           }
-        })), person, date));
+        }));
+        cardPanel.appendChild(renderSubtaskTimerTable(itemRows.concat(reworkRows), person, date));
       });
 
       jobPanels.push({ key: buildId + '|__manualjob__', el: cardPanel, dragHandle });
