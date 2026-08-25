@@ -4059,7 +4059,7 @@
     if (kind === 'lostTime') return 'Lost time';
     if (kind === 'rework') return 'Rework';
     if (kind === 'supervision') return 'Supervision / Training';
-    if (kind === 'factoryMaintenance') return 'Factory Maintenance / Lost Time';
+    if (kind === 'factoryMaintenance') return 'Factory Maintenance';
     return 'Ad-hoc';
   }
 
@@ -4096,6 +4096,22 @@
     let entry = state.adHocCards.find(c => c.personId === personId && c.date === date && c.kind === 'factoryMaintenance');
     if (!entry){
       entry = { id: uid('adhoc'), personId, date, description: '', note: '', buildId: build.id, taskId: null, kind: 'factoryMaintenance', jobNumber: '', hours: 0, completed: false, timeLogs: [], timerRunning: false };
+      state.adHocCards.push(entry);
+    }
+    return entry;
+  }
+
+  // Same pattern, own dedicated Start/Stop control and its own kind — a separate task from Factory
+  // Maintenance (previously the two shared one combined control), still riding on the same fixed evergreen
+  // job since neither has a real job to pick.
+  function findOrCreateLostTimeEntry(personId, date){
+    const build = state.builds.find(b => b.jobRecordId === FACTORY_MAINT_JOB_ID);
+    if (!build) return null;
+    // Scoped to the fixed evergreen job specifically (not just kind === 'lostTime') so this dedicated control
+    // never picks up a one-off "Lost time" entry someone logged against a real job via the generic ad-hoc form.
+    let entry = state.adHocCards.find(c => c.personId === personId && c.date === date && c.kind === 'lostTime' && c.buildId === build.id && !c.taskId);
+    if (!entry){
+      entry = { id: uid('adhoc'), personId, date, description: '', note: '', buildId: build.id, taskId: null, kind: 'lostTime', jobNumber: '', hours: 0, completed: false, timeLogs: [], timerRunning: false };
       state.adHocCards.push(entry);
     }
     return entry;
@@ -6000,40 +6016,45 @@
       container.appendChild(supPanel);
     }
 
-    // Same Start/Stop pattern, but on every card (no supervisor gate) and with no job to pick — it's always the
-    // one fixed Factory Maintenance / Lost Time job (see FACTORY_MAINT_JOB_ID).
-    {
-      const fmRunningEntry = state.adHocCards.find(c => c.personId === person.id && c.date === date && c.kind === 'factoryMaintenance' && c.timerRunning);
-      const fmPanel = document.createElement('div'); fmPanel.className = 'panel';
-      const fmRow = document.createElement('div'); fmRow.style.display = 'flex'; fmRow.style.alignItems = 'center'; fmRow.style.gap = '10px'; fmRow.style.flexWrap = 'wrap';
-      const fmLabel = document.createElement('div'); fmLabel.style.fontWeight = '700'; fmLabel.textContent = 'Factory Maintenance / Lost Time';
-      fmRow.appendChild(fmLabel);
+    // Same Start/Stop pattern on every card (no supervisor gate), with no job to pick — always the one fixed
+    // evergreen job (see FACTORY_MAINT_JOB_ID). Factory Maintenance and Lost Time are two separate tasks with
+    // their own dedicated control each (previously one combined "Factory Maintenance / Lost Time" button) so
+    // the two track and report separately.
+    const fixedJobBuild = state.builds.find(b => b.jobRecordId === FACTORY_MAINT_JOB_ID);
+    function renderFixedClockControl(label, kind, findOrCreateEntry, missingMsg){
+      const runningEntry = state.adHocCards.find(c => c.personId === person.id && c.date === date && c.kind === kind && c.timerRunning);
+      const panel = document.createElement('div'); panel.className = 'panel';
+      const row = document.createElement('div'); row.style.display = 'flex'; row.style.alignItems = 'center'; row.style.gap = '10px'; row.style.flexWrap = 'wrap';
+      const labelEl = document.createElement('div'); labelEl.style.fontWeight = '700'; labelEl.textContent = label;
+      row.appendChild(labelEl);
 
-      const fmBtn = document.createElement('button'); fmBtn.className = 'btn-lg ' + (fmRunningEntry ? 'primary' : 'ghost');
-      fmBtn.textContent = fmRunningEntry ? '⏹ Stop' : '▶ Start';
-      fmRow.appendChild(fmBtn);
+      const btn = document.createElement('button'); btn.className = 'btn-lg ' + (runningEntry ? 'primary' : 'ghost');
+      btn.textContent = runningEntry ? '⏹ Stop' : '▶ Start';
+      row.appendChild(btn);
 
-      const fmTimeInfo = document.createElement('span'); fmTimeInfo.className = 'hint';
-      if (fmRunningEntry){
-        const openLog = [...fmRunningEntry.timeLogs].reverse().find(tl => !tl.stopTime);
-        fmTimeInfo.textContent = openLog ? `Started ${openLog.startTime} — ⏱ ${cumulativeElapsedLabel(fmRunningEntry, person.id)}` : '';
+      const timeInfo = document.createElement('span'); timeInfo.className = 'hint';
+      if (runningEntry){
+        const openLog = [...runningEntry.timeLogs].reverse().find(tl => !tl.stopTime);
+        timeInfo.textContent = openLog ? `Started ${openLog.startTime} — ⏱ ${cumulativeElapsedLabel(runningEntry, person.id)}` : '';
       }
-      fmRow.appendChild(fmTimeInfo);
+      row.appendChild(timeInfo);
 
-      fmBtn.addEventListener('click', () => {
-        if (fmRunningEntry){
-          toggleSubtaskTimer(fmRunningEntry, person.id, date);
+      btn.addEventListener('click', () => {
+        if (runningEntry){
+          toggleSubtaskTimer(runningEntry, person.id, date);
         } else {
-          const entry = findOrCreateFactoryMaintenanceEntry(person.id, date);
-          if (!entry){ alert('Factory Maintenance / Lost Time job isn\'t set up yet — reload and try again.'); return; }
+          const entry = findOrCreateEntry(person.id, date);
+          if (!entry){ alert(missingMsg); return; }
           toggleSubtaskTimer(entry, person.id, date);
         }
         renderJobCardsLivePage();
       });
 
-      fmPanel.appendChild(fmRow);
-      container.appendChild(fmPanel);
+      panel.appendChild(row);
+      container.appendChild(panel);
     }
+    renderFixedClockControl('Factory Maintenance', 'factoryMaintenance', findOrCreateFactoryMaintenanceEntry, 'Factory Maintenance job isn\'t set up yet — reload and try again.');
+    renderFixedClockControl('Lost Time', 'lostTime', findOrCreateLostTimeEntry, 'Lost Time job isn\'t set up yet — reload and try again.');
 
     // Rework logged against a job/task that's already on the card gets folded into that task's own sub-task
     // list (bottom row) instead of showing as its own separate panel — tidier, and it's obviously the same
@@ -6257,11 +6278,13 @@
       container.appendChild(el);
     });
 
-    // Supervision and Factory Maintenance / Lost Time entries each get their own Start/Stop control (top of
-    // card) and completed-summary (bottom of card) instead — see those blocks — so they're deliberately
-    // skipped here to avoid showing twice. Rework already folded into its matching task card above (see
-    // attachedAdHocIds) is skipped for the same reason — one job, one card.
-    adHoc.filter(c => c.kind !== 'supervision' && c.kind !== 'factoryMaintenance' && !attachedAdHocIds.has(c.id)).forEach(c => {
+    // Supervision, Factory Maintenance, and the dedicated Lost Time entry each get their own Start/Stop
+    // control (top of card) and completed-summary (bottom of card) instead — see those blocks — so they're
+    // deliberately skipped here to avoid showing twice. A "Lost time" entry against a real job (logged via the
+    // generic Add work form) is a different thing and still belongs in this list. Rework already folded into
+    // its matching task card above (see attachedAdHocIds) is skipped for the same reason — one job, one card.
+    const isDedicatedLostTime = c => c.kind === 'lostTime' && fixedJobBuild && c.buildId === fixedJobBuild.id && !c.taskId;
+    adHoc.filter(c => c.kind !== 'supervision' && c.kind !== 'factoryMaintenance' && !isDedicatedLostTime(c) && !attachedAdHocIds.has(c.id)).forEach(c => {
       const cardPanel = document.createElement('div'); cardPanel.className = 'panel'; cardPanel.style.marginTop = '10px';
       cardPanel.innerHTML = `<h2>${adHocCardTitle(c)}</h2>`;
       cardPanel.appendChild(renderSubtaskTimerTable([{
@@ -6312,24 +6335,25 @@
       }
     }
 
-    // At most one Factory Maintenance / Lost Time entry per day (always the same fixed job) — shows here the
-    // moment they've clocked on at least once today (not just once there's accumulated hours), so a comment can
-    // be added right away rather than only after stopping. Full row (note + delete), same as Lost Time/Rework
-    // below, not just a bare total — the Start/Stop button here duplicates the one at the top of the card, but
-    // both act on the same entry so either works.
-    {
-      const fmEntry = state.adHocCards.find(c => c.personId === person.id && c.date === date && c.kind === 'factoryMaintenance');
-      if (fmEntry){
-        const fmDonePanel = document.createElement('div'); fmDonePanel.className = 'panel'; fmDonePanel.style.marginTop = '10px';
-        fmDonePanel.innerHTML = '<h2>Factory Maintenance / Lost Time</h2>';
-        fmDonePanel.appendChild(renderSubtaskTimerTable([{
-          obj: fmEntry, number: '', name: fmEntry.description || 'Factory Maintenance / Lost Time', notes: fmEntry.note, time: fmEntry.hours + 'h',
-          onNoteChange: (val) => { fmEntry.note = val; save(); },
-          onDelete: () => { state.adHocCards = state.adHocCards.filter(x => x.id !== fmEntry.id); save(); renderJobCardsLivePage(); }
-        }], person, date));
-        container.appendChild(fmDonePanel);
-      }
+    // At most one entry per day for each of Factory Maintenance / Lost Time (always the same fixed job) —
+    // shows here the moment they've clocked on at least once today (not just once there's accumulated hours),
+    // so a comment can be added right away rather than only after stopping. Full row (note + delete), same as
+    // Rework below, not just a bare total — the Start/Stop button here duplicates the one at the top of the
+    // card, but both act on the same entry so either works.
+    function renderFixedClockDoneSummary(label, kind, matchesEntry){
+      const entry = state.adHocCards.find(c => c.personId === person.id && c.date === date && c.kind === kind && matchesEntry(c));
+      if (!entry) return;
+      const donePanel = document.createElement('div'); donePanel.className = 'panel'; donePanel.style.marginTop = '10px';
+      donePanel.innerHTML = `<h2>${label}</h2>`;
+      donePanel.appendChild(renderSubtaskTimerTable([{
+        obj: entry, number: '', name: entry.description || label, notes: entry.note, time: entry.hours + 'h',
+        onNoteChange: (val) => { entry.note = val; save(); },
+        onDelete: () => { state.adHocCards = state.adHocCards.filter(x => x.id !== entry.id); save(); renderJobCardsLivePage(); }
+      }], person, date));
+      container.appendChild(donePanel);
     }
+    renderFixedClockDoneSummary('Factory Maintenance', 'factoryMaintenance', () => true);
+    renderFixedClockDoneSummary('Lost Time', 'lostTime', c => fixedJobBuild && c.buildId === fixedJobBuild.id && !c.taskId);
 
     // Any job (scheduled today or not), optionally a specific task, and optionally tagged Lost time/Rework —
     // deliberately at the very bottom of the card, after everything already on it. Collapsed behind a button
@@ -6713,9 +6737,11 @@
 
   // Time clocked against the fixed Factory Maintenance / Lost Time job, grouped by calendar month so each
   // month reads as its own fresh total (per the "resets every month" requirement) without ever deleting
-  // anything — older months just sit further down, most recent first.
-  function renderFactoryMaintenanceReportSection(container){
-    const entries = state.adHocCards.filter(c => c.kind === 'factoryMaintenance' && (c.timeLogs || []).length);
+  // anything — older months just sit further down, most recent first. Factory Maintenance and Lost Time are
+  // separate tasks (separate dedicated Start/Stop controls — see renderFixedClockControl) and get their own
+  // report section each, rather than one combined total.
+  function renderFixedClockReportSection(container, title, hint, matchesEntry){
+    const entries = state.adHocCards.filter(c => matchesEntry(c) && (c.timeLogs || []).length);
     if (!entries.length) return;
 
     const byMonth = new Map(); // 'YYYY-MM' -> Map(personId -> hours)
@@ -6733,7 +6759,7 @@
     if (!byMonth.size) return;
 
     const panel = document.createElement('div'); panel.className = 'panel'; panel.style.marginTop = '16px';
-    panel.innerHTML = '<h2>Factory Maintenance / Lost Time</h2><div class="hint">Time clocked from the dedicated Start/Stop control on every job card, grouped by month — each month starts fresh; nothing is ever deleted, so past months stay here to look back on.</div>';
+    panel.innerHTML = `<h2>${title}</h2><div class="hint">${hint}</div>`;
 
     Array.from(byMonth.keys()).sort().reverse().forEach(monthKey => {
       const [y, m] = monthKey.split('-').map(Number);
@@ -7274,7 +7300,11 @@
     }
 
     container.appendChild(panel);
-    renderFactoryMaintenanceReportSection(container);
+    renderFixedClockReportSection(container, 'Factory Maintenance', 'Time clocked from the dedicated Start/Stop control on every job card, grouped by month — each month starts fresh; nothing is ever deleted, so past months stay here to look back on.', c => c.kind === 'factoryMaintenance');
+    {
+      const fixedBuild = state.builds.find(b => b.jobRecordId === FACTORY_MAINT_JOB_ID);
+      renderFixedClockReportSection(container, 'Lost Time', 'Time clocked from the dedicated Lost Time Start/Stop control on every job card, grouped by month — each month starts fresh; nothing is ever deleted, so past months stay here to look back on.', c => c.kind === 'lostTime' && fixedBuild && c.buildId === fixedBuild.id && !c.taskId);
+    }
     renderAdHocReportSection(container);
   }
 
