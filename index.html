@@ -5027,6 +5027,18 @@
       meta.textContent = `${c.machineType || ''} · ${c.hours}h · ${c.status || 'scheduled'}${otherPerson ? ' · currently: ' + otherPerson.name : ''}`;
       top.appendChild(meta);
 
+      // A second, distinct drag handle from the cross-date one on the left — this one reorders cards within
+      // this same day's list (shared order with the employee's own Job Card, see sortByCardOrder), rather than
+      // moving anything to a different date.
+      let reorderHandle = null;
+      if (!opts.pulled && cb && cb.checked){
+        reorderHandle = document.createElement('span'); reorderHandle.className = 'drag-handle'; reorderHandle.textContent = '⠿';
+        reorderHandle.title = 'Drag to reorder within this day';
+        reorderHandle.draggable = true;
+        reorderHandle.addEventListener('click', (e) => e.stopPropagation());
+        top.appendChild(reorderHandle);
+      }
+
       row.appendChild(top);
 
       if (opts.pulled || (cb && cb.checked)){
@@ -5081,11 +5093,14 @@
         }
       }
 
-      groupWrap.appendChild(row);
+      return { key: c.buildId + '|' + c.taskId, el: row, reorderHandle };
     }
 
-    cards.forEach(c => renderCardRow(c, { pulled: false }));
-    pulledTasks.forEach(c => renderCardRow(c, { pulled: true }));
+    // Real/pulled task rows, in the person's saved order (shared with their own Job Card — see
+    // sortByCardOrder) — anything not yet in that order falls in wherever it would have rendered anyway.
+    const dayCardRows = [];
+    cards.forEach(c => dayCardRows.push(renderCardRow(c, { pulled: false })));
+    pulledTasks.forEach(c => dayCardRows.push(renderCardRow(c, { pulled: true })));
 
     adHoc.forEach(c => {
       const row = document.createElement('div'); row.className = 'drill-row'; row.style.marginTop = '6px';
@@ -5149,16 +5164,23 @@
       if (!manualByBuild.has(m.buildId)) manualByBuild.set(m.buildId, []);
       manualByBuild.get(m.buildId).push(m);
     });
-    manualByBuild.forEach(items => {
+    manualByBuild.forEach((items, buildId) => {
+      const groupEl = document.createElement('div');
       const jobRow = document.createElement('div'); jobRow.className = 'drill-row'; jobRow.style.marginTop = '6px'; jobRow.style.background = 'var(--bg)';
       const jobMain = document.createElement('div'); jobMain.className = 'drill-main';
       jobMain.textContent = jobIdentityLabel(items[0].jobNumber, items[0].dealer, items[0].customer);
       jobRow.appendChild(jobMain);
+      const jobMetaWrap = document.createElement('div'); jobMetaWrap.style.display = 'flex'; jobMetaWrap.style.alignItems = 'center'; jobMetaWrap.style.gap = '10px';
       const jobMeta = document.createElement('div'); jobMeta.className = 'drill-meta';
       const jobHours = items.reduce((s, m) => s + (Number(m.subtask.standardTime) || 0), 0);
       jobMeta.textContent = `${items.length} task${items.length === 1 ? '' : 's'} added — ${jobHours}h`;
-      jobRow.appendChild(jobMeta);
-      groupWrap.appendChild(jobRow);
+      jobMetaWrap.appendChild(jobMeta);
+      const reorderHandle = document.createElement('span'); reorderHandle.className = 'drag-handle'; reorderHandle.textContent = '⠿';
+      reorderHandle.title = 'Drag to reorder within this day';
+      reorderHandle.draggable = true;
+      jobMetaWrap.appendChild(reorderHandle);
+      jobRow.appendChild(jobMetaWrap);
+      groupEl.appendChild(jobRow);
 
       items.forEach(m => {
         const row = document.createElement('div'); row.className = 'drill-row'; row.style.marginTop = '4px'; row.style.paddingLeft = '20px';
@@ -5177,8 +5199,41 @@
         });
         rightWrap.appendChild(removeBtn);
         row.appendChild(rightWrap);
-        groupWrap.appendChild(row);
+        groupEl.appendChild(row);
       });
+
+      dayCardRows.push({ key: buildId + '|__manualjob__', el: groupEl, reorderHandle });
+    });
+
+    // Apply the saved order (shared with the employee's own Job Card) and wire up drag-to-reorder.
+    sortByCardOrder(dayCardRows, person.id, date).forEach(({ key, el, reorderHandle }) => {
+      if (reorderHandle){
+        reorderHandle.addEventListener('dragstart', (e) => {
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', JSON.stringify({ kind: 'card-reorder', key }));
+          el.style.opacity = '0.4';
+        });
+        reorderHandle.addEventListener('dragend', () => { el.style.opacity = ''; });
+      }
+      el.addEventListener('dragover', (e) => {
+        if (!e.dataTransfer.types.includes('text/plain')) return;
+        e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+      });
+      el.addEventListener('drop', (e) => {
+        let payload;
+        try { payload = JSON.parse(e.dataTransfer.getData('text/plain')); } catch { return; }
+        if (!payload || payload.kind !== 'card-reorder' || payload.key === key) return;
+        e.preventDefault(); e.stopPropagation();
+        const displayedKeys = sortByCardOrder(dayCardRows, person.id, date).map(p => p.key);
+        const from = displayedKeys.indexOf(payload.key);
+        const to = displayedKeys.indexOf(key);
+        if (from === -1 || to === -1) return;
+        displayedKeys.splice(from, 1);
+        displayedKeys.splice(to, 0, payload.key);
+        setCardOrder(person.id, date, displayedKeys);
+        renderJobCardsPage();
+      });
+      groupWrap.appendChild(el);
     });
 
     // This day's card list above only ever shows work the schedule engine actually allocated to `date` — a
