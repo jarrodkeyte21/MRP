@@ -6534,40 +6534,44 @@
   // was worked. This sources cards from what genuinely happened instead: a sign-off record, a real clocked
   // timeLog, or a manual-add — any one of the three is enough for that (build, task) to count as a real card
   // on this date, regardless of the engine's opinion of it.
+  // A job card only belongs in Archive once a manager has actually signed it off — real clocked time or a
+  // manual-add on its own isn't enough (that's what Sign Off itself is for). state.actuals[date][buildId][taskId]
+  // is the one source of truth for "signed off".
   function archiveCardsForDate(date){
     const results = [];
-    state.jobRecords.forEach(jr => {
-      const build = state.builds.find(b => b.jobRecordId === jr.id);
+    const dayActuals = state.actuals[date];
+    if (!dayActuals) return results;
+    Object.keys(dayActuals).forEach(buildId => {
+      const build = state.builds.find(b => b.id === buildId);
       if (!build) return;
-      (jr.tasks || []).forEach(t => {
-        const taskId = t.taskRefId;
-        if (!taskId) return;
-        const signedRec = (state.actuals[date] && state.actuals[date][build.id]) ? state.actuals[date][build.id][taskId] : null;
-        const manualEntries = [];
-        (t.subtasks || []).forEach(st => (st.manualAdds || []).forEach(m => { if (m.date === date) manualEntries.push(m); }));
-        const loggedHours = (t.subtasks || []).reduce((s, st) =>
-          s + (st.timeLogs || []).filter(tl => tl.date === date).reduce((ss, tl) => ss + logEntryHours(tl, st), 0), 0);
-        if (!signedRec && !manualEntries.length && loggedHours <= 0) return;
+      const jr = state.jobRecords.find(j => j.id === build.jobRecordId);
+      Object.keys(dayActuals[buildId]).forEach(taskId => {
+        const signedRec = dayActuals[buildId][taskId];
+        if (!signedRec) return;
+        const jrTask = jr ? jr.tasks.find(x => x.taskRefId === taskId) : null;
 
         const eff = effectiveBuildData(build);
         const task = state.tasks.find(x => x.id === taskId);
         // Best-effort assignee for a historical card: whoever it was manually added for, else whoever logged
         // the most time against it that day, else whoever the task is assigned to right now.
-        let personId = manualEntries.length ? manualEntries[0].personId : null;
-        if (!personId){
-          const counts = {};
-          (t.subtasks || []).forEach(st => (st.timeLogs || []).forEach(tl => { if (tl.date === date && tl.personId) counts[tl.personId] = (counts[tl.personId] || 0) + 1; }));
-          const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
-          if (top) personId = top[0];
+        let personId = null;
+        if (jrTask){
+          const manualEntry = (jrTask.subtasks || []).flatMap(st => st.manualAdds || []).find(m => m.date === date);
+          if (manualEntry) personId = manualEntry.personId;
+          if (!personId){
+            const counts = {};
+            (jrTask.subtasks || []).forEach(st => (st.timeLogs || []).forEach(tl => { if (tl.date === date && tl.personId) counts[tl.personId] = (counts[tl.personId] || 0) + 1; }));
+            const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+            if (top) personId = top[0];
+          }
         }
         if (!personId && build.taskAssignments && build.taskAssignments[taskId]) personId = build.taskAssignments[taskId].personId || null;
 
         results.push({
-          buildId: build.id, taskId, taskName: task ? task.name : jobTaskDisplayName(t),
+          buildId: build.id, taskId, taskName: task ? task.name : (jrTask ? jobTaskDisplayName(jrTask) : '(task)'),
           jobNumber: eff.jobNumber, dealer: eff.dealer, customer: eff.customer, machineType: eff.machineType,
-          hours: signedRec ? signedRec.hours : Math.round(loggedHours * 100) / 100,
-          status: build.status, assignedPersonId: personId, secondaryPersonIds: [], date,
-          manualOnly: manualEntries.length > 0 && loggedHours <= 0 && !signedRec
+          hours: signedRec.hours, status: build.status, assignedPersonId: personId, secondaryPersonIds: [], date,
+          manualOnly: false
         });
       });
     });
@@ -6671,7 +6675,7 @@
     container.innerHTML = '';
 
     const panel = document.createElement('div'); panel.className = 'panel';
-    panel.innerHTML = '<h2>Archive</h2><div class="hint">Every job card with real history — signed off, clocked time, or manually added — newest first. Click a card for a simple report of what was actually done that day. Sign-off status shown per card, with a "Reactivate" undo if one needs correcting. Filter below, or export.</div>';
+    panel.innerHTML = '<h2>Archive</h2><div class="hint">Every job card signed off by a manager, newest first — clocked time or a manual add alone isn\'t enough to land here, that\'s what Sign Off is for. Click a card for a simple report of what was actually done that day, with a "Reactivate" undo if one needs correcting. Filter below, or export.</div>';
 
     const filterRow = document.createElement('div'); filterRow.className = 'field-row'; filterRow.style.marginTop = '10px'; filterRow.style.flexWrap = 'wrap';
     const fromLabel = document.createElement('label'); fromLabel.textContent = 'From';
@@ -6730,14 +6734,11 @@
 
     container.appendChild(panel);
 
-    // Every date with real history — a sign-off, a clocked timeLog, or a manual-add — regardless of how
-    // recent it is (a card signed off minutes ago belongs here just as much as one from months back), plus
-    // any ad-hoc entry's own date.
+    // Every date with a real sign-off, regardless of how recent it is (a card signed off minutes ago belongs
+    // here just as much as one from months back) — clocked time or a manual-add alone isn't enough, that's
+    // what Sign Off itself is for (see archiveCardsForDate) — plus any ad-hoc entry's own date, since those
+    // have no sign-off step of their own to gate on.
     const historyDates = new Set();
-    state.jobRecords.forEach(jr => (jr.tasks || []).forEach(t => (t.subtasks || []).forEach(st => {
-      (st.timeLogs || []).forEach(tl => { if (tl.date) historyDates.add(tl.date); });
-      (st.manualAdds || []).forEach(m => { if (m.date) historyDates.add(m.date); });
-    })));
     Object.keys(state.actuals || {}).forEach(d => historyDates.add(d));
     state.adHocCards.forEach(c => {
       if (c.date) historyDates.add(c.date);
@@ -6929,7 +6930,7 @@
       const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
       empty.textContent = archiveFilters.from || archiveFilters.to || archiveFilters.personId || archiveFilters.jobNumber
         ? 'Nothing archived matches these filters.'
-        : 'Nothing archived yet — job cards land here once there\'s a sign-off, clocked time, or a manual add against them.';
+        : 'Nothing archived yet — job cards land here once a manager signs them off.';
       panel.appendChild(empty);
     }
   }
