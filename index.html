@@ -6574,12 +6574,76 @@
     return results;
   }
 
+  let archiveExpanded = new Set();
+
+  // A simplified, read-only report of what actually happened on this one card that day — not the live,
+  // editable Job Card (Start/Stop, ticking checkboxes, etc.), which doesn't make sense for history anyway
+  // since a past date has no "live" schedule allocation to hang a checklist window off (see archiveCardsForDate).
+  // Just: which sub-tasks had real hours that day, every session logged against them, and the sign-off state.
+  function renderArchiveCardReport(container, c, date){
+    const detail = document.createElement('div'); detail.className = 'signoff-row-detail';
+    const raw = state.builds.find(b => b.id === c.buildId);
+    const jrTask = jobCardSourceTask(raw, c.taskId);
+    const signedRec = (state.actuals[date] && state.actuals[date][c.buildId]) ? state.actuals[date][c.buildId][c.taskId] : null;
+    const allSubtasks = jrTask ? jrTask.subtasks.filter(st => st.selected) : [];
+
+    const activeSubtasks = allSubtasks.filter(st =>
+      (st.timeLogs || []).some(tl => tl.date === date) || (st.manualAdds || []).some(m => m.date === date));
+    if (activeSubtasks.length){
+      const table = document.createElement('table'); table.className = 'editor'; table.style.marginTop = '8px';
+      table.innerHTML = '<thead><tr><th>Sub-task</th><th style="width:80px">Hours used</th><th style="width:80px">Completed</th></tr></thead>';
+      const tbody = document.createElement('tbody');
+      activeSubtasks.forEach(st => {
+        const usedThatDay = (st.timeLogs || []).filter(tl => tl.date === date).reduce((s, tl) => s + logEntryHours(tl, st), 0);
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${(st.number ? st.number + ' — ' : '') + st.name}</td><td>${Math.round(usedThatDay * 100) / 100}h</td><td>${st.completed ? '✓' : '—'}</td>`;
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      detail.appendChild(table);
+    }
+
+    const sessions = [];
+    allSubtasks.forEach(st => (st.timeLogs || []).forEach(tl => { if (tl.date === date) sessions.push({ st, tl }); }));
+    if (sessions.length){
+      const sessHeading = document.createElement('div'); sessHeading.style.marginTop = '10px'; sessHeading.style.fontWeight = '700';
+      sessHeading.textContent = 'Sessions';
+      detail.appendChild(sessHeading);
+      const table2 = document.createElement('table'); table2.className = 'editor'; table2.style.marginTop = '4px';
+      table2.innerHTML = '<thead><tr><th>Sub-task</th><th>Who</th><th style="width:80px">Start</th><th style="width:80px">Stop</th><th style="width:70px">Hours</th></tr></thead>';
+      const tbody2 = document.createElement('tbody');
+      sessions
+        .sort((a, b) => (a.tl.startTime || '') < (b.tl.startTime || '') ? -1 : 1)
+        .forEach(({ st, tl }) => {
+          const person = state.people.find(p => p.id === tl.personId);
+          const hrs = Math.round(logEntryHours(tl, st) * 100) / 100;
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${st.name}</td><td>${person ? person.name : '(unassigned)'}</td><td>${tl.startTime || '—'}</td><td>${tl.stopTime || '—'}</td><td>${hrs}h</td>`;
+          tbody2.appendChild(tr);
+        });
+      table2.appendChild(tbody2);
+      detail.appendChild(table2);
+    }
+
+    if (!activeSubtasks.length && !sessions.length){
+      const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '8px';
+      empty.textContent = 'No checklist detail for this card — just the hours below.';
+      detail.appendChild(empty);
+    }
+
+    const summary = document.createElement('div'); summary.style.marginTop = '10px'; summary.style.fontWeight = '700';
+    summary.textContent = `Planned: ${c.hours}h` + (signedRec ? ` · Signed off: ${signedRec.hours}h (${signedRec.complete ? 'complete' : 'not complete'})` : ' · Not signed off');
+    detail.appendChild(summary);
+
+    container.appendChild(detail);
+  }
+
   function renderArchivePage(){
     const container = document.getElementById('archiveSection');
     container.innerHTML = '';
 
     const panel = document.createElement('div'); panel.className = 'panel';
-    panel.innerHTML = '<h2>Archive</h2><div class="hint">Every job card with real history — signed off, clocked time, or manually added — newest first. Sign-off status shown per card, with a "Reactivate" undo if one needs correcting. Click a card\'s name to review its checklist. Filter below, or export.</div>';
+    panel.innerHTML = '<h2>Archive</h2><div class="hint">Every job card with real history — signed off, clocked time, or manually added — newest first. Click a card for a simple report of what was actually done that day. Sign-off status shown per card, with a "Reactivate" undo if one needs correcting. Filter below, or export.</div>';
 
     const filterRow = document.createElement('div'); filterRow.className = 'field-row'; filterRow.style.marginTop = '10px'; filterRow.style.flexWrap = 'wrap';
     const fromLabel = document.createElement('label'); fromLabel.textContent = 'From';
@@ -6669,14 +6733,17 @@
       cards.forEach(c => {
         allExportRows.push(archiveCardCsvRow(c, date));
         const signedRec = (state.actuals[date] && state.actuals[date][c.buildId]) ? state.actuals[date][c.buildId][c.taskId] : null;
-        const row = document.createElement('div'); row.className = 'drill-row'; row.style.cursor = 'default';
-        const main = document.createElement('div'); main.className = 'drill-main'; main.style.cursor = 'pointer';
-        main.textContent = `${jobIdentityLabel(c.jobNumber, c.dealer, c.customer)} — ${c.taskName}`;
+        const cardKey = date + '|' + c.buildId + '|' + c.taskId;
+        const expanded = archiveExpanded.has(cardKey);
+        const rowWrap = document.createElement('div'); rowWrap.className = 'signoff-row';
+        const main = document.createElement('div'); main.className = 'signoff-row-main';
         main.addEventListener('click', () => {
-          jobCardsView.level = 'card'; jobCardsView.cardBuildId = c.buildId; jobCardsView.cardTaskId = c.taskId; jobCardsView.cardDate = c.date;
-          showPage('jobcards');
+          if (expanded) archiveExpanded.delete(cardKey); else archiveExpanded.add(cardKey);
+          renderArchivePage();
         });
-        row.appendChild(main);
+        const left = document.createElement('div'); left.className = 'drill-main';
+        left.textContent = `${jobIdentityLabel(c.jobNumber, c.dealer, c.customer)} — ${c.taskName}`;
+        main.appendChild(left);
         const rightWrap = document.createElement('div'); rightWrap.style.display = 'flex'; rightWrap.style.alignItems = 'center'; rightWrap.style.gap = '10px';
         const meta = document.createElement('div'); meta.className = 'drill-meta';
         const assignedPerson = state.people.find(p => p.id === c.assignedPersonId);
@@ -6689,7 +6756,8 @@
           const reactivateBtn = document.createElement('button'); reactivateBtn.className = 'ghost icon';
           reactivateBtn.textContent = '↩ Reactivate';
           reactivateBtn.title = 'Undo this sign-off — sends it back to Sign Off as pending.';
-          reactivateBtn.addEventListener('click', () => {
+          reactivateBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
             if (!confirm(`Undo the sign-off for ${jobIdentityLabel(c.jobNumber, c.dealer, c.customer)} — ${c.taskName} on ${fmtDateLong(date)}?`)) return;
             undoSignOffCard(date, c.buildId, c.taskId);
             renderArchivePage(); renderSignoffFab();
@@ -6698,10 +6766,14 @@
         }
         const exportBtn = document.createElement('button'); exportBtn.className = 'icon ghost'; exportBtn.textContent = '⤓';
         exportBtn.title = 'Export this card (CSV)';
-        exportBtn.addEventListener('click', () => exportArchiveCard(c, date));
+        exportBtn.addEventListener('click', (e) => { e.stopPropagation(); exportArchiveCard(c, date); });
         rightWrap.appendChild(exportBtn);
-        row.appendChild(rightWrap);
-        list.appendChild(row);
+        const chevron = document.createElement('span'); chevron.className = 'drill-meta'; chevron.textContent = expanded ? '▾' : '▸';
+        rightWrap.appendChild(chevron);
+        main.appendChild(rightWrap);
+        rowWrap.appendChild(main);
+        if (expanded) renderArchiveCardReport(rowWrap, c, date);
+        list.appendChild(rowWrap);
       });
       adHoc.forEach(c => {
         const row = document.createElement('div'); row.className = 'drill-row'; row.style.cursor = 'default';
