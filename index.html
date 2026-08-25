@@ -4959,7 +4959,7 @@
     groupWrap.appendChild(manualToggle);
     if (manualIsOpen){
       const manualPanel = document.createElement('div'); manualPanel.style.marginTop = '4px'; manualPanel.style.paddingLeft = '10px';
-      renderAdHocForm(manualPanel, person, { date }, renderJobCardsPage);
+      renderAdHocForm(manualPanel, person, { date }, renderJobCardsPage, { checkPrerequisites: true });
       groupWrap.appendChild(manualPanel);
     }
 
@@ -4970,9 +4970,10 @@
   // them: normal one-off cover/cleanup work, clocking Lost Time, or logging Rework — all three are the same
   // underlying ad-hoc card, just tagged with a different `kind` and optionally linked to a real job (and,
   // optionally, a specific shop task within it) instead of typed as free text.
-  function renderAdHocForm(panel, person, defaults, onAdd){
+  function renderAdHocForm(panel, person, defaults, onAdd, opts){
     defaults = defaults || {};
     onAdd = onAdd || renderJobCardsPage;
+    opts = opts || {};
     const heading = document.createElement('div'); heading.style.marginTop = '16px'; heading.style.fontWeight = '700';
     heading.textContent = 'Add work to this card';
     panel.appendChild(heading);
@@ -5110,10 +5111,12 @@
     addBtn.addEventListener('click', () => {
       if (!descInp.value.trim() && !jobSel.value){ alert('Enter a description or pick a job first.'); return; }
       const date = dateInp.value || jobCardsView.date;
-      // A task added here bypasses the scheduler entirely, so its normal dependency ordering was never
-      // checked — warn (naming what it depends on) rather than silently letting it start out of sequence, but
-      // still let the manager go ahead since sometimes that's deliberate (e.g. genuinely working ahead).
-      if (jobSel.value && taskSel.value){
+      // Only the manager's "manually assign work the scheduler skipped" picker checks this — it's placing a
+      // task ahead of when the scheduler would normally reach it, so a dependency warning is genuinely useful
+      // there. The floor's own "log what I'm actually doing" use of this same form (and a manager just
+      // recording real work) must never be gated behind a confirm() — that's recording reality, not planning
+      // ahead, and blocking it here is what silently broke "Add to this card" for everyone else.
+      if (opts.checkPrerequisites && jobSel.value && taskSel.value){
         const raw = state.builds.find(b => b.id === jobSel.value);
         const depNames = raw ? taskDependencyNames(raw, taskSel.value) : [];
         if (depNames.length && !confirm(`This task depends on ${depNames.join(', ')} — make sure ${depNames.length === 1 ? 'it is' : 'they are'} actually finished first. Add it anyway?`)) return;
@@ -5358,15 +5361,23 @@
     return h * 60 + m;
   }
 
-  // How long a still-running session has been going, as "1h 23m" / "8m" — recomputed fresh on every render, so
-  // it ticks forward on its own via the existing 5-second auto-refresh with no extra timer/interval to leak.
-  // If "now" reads earlier than the start (crossed midnight since clocking on), treats it as 0 rather than
-  // showing a negative/nonsense duration.
-  function elapsedLabel(startTimeHHMM){
-    const startMin = timeToMinutes(startTimeHHMM);
-    const nowMin = timeToMinutes(nowTimeHHMM());
-    const diff = Math.max(0, nowMin - startMin);
-    const h = Math.floor(diff / 60), m = diff % 60;
+  // Live-ticking running total for this person on this task, as "1h 23m" / "8m" — recomputed fresh on every
+  // render, so it ticks forward on its own via the existing 5-second auto-refresh with no extra timer/interval
+  // to leak. Sums every closed session of theirs (logEntryHours already handles shared-clock overlap
+  // splitting) plus however long the currently-open one has been going, so stopping and restarting the timer
+  // during the day doesn't reset what's shown — it's cumulative time on the task, not just this one session.
+  function cumulativeElapsedLabel(obj, personId){
+    const logs = obj.timeLogs || [];
+    const closedMinutes = logs
+      .filter(tl => tl.personId === personId && tl.stopTime)
+      .reduce((sum, tl) => sum + logEntryHours(tl, obj) * 60, 0);
+    const open = [...logs].reverse().find(tl => !tl.stopTime && tl.personId === personId);
+    let totalMin = closedMinutes;
+    if (open && open.startTime){
+      totalMin += Math.max(0, timeToMinutes(nowTimeHHMM()) - timeToMinutes(open.startTime));
+    }
+    totalMin = Math.round(totalMin);
+    const h = Math.floor(totalMin / 60), m = totalMin % 60;
     return h > 0 ? `${h}h ${m}m` : `${m}m`;
   }
 
@@ -5460,14 +5471,13 @@
       timerBtn.addEventListener('click', () => { toggleSubtaskTimer(obj, person.id, date, taskIdForTimerObj(obj)); renderJobCardsLivePage(); });
       actions.appendChild(timerBtn);
 
-      // Lets the employee see how long they've been clocked on without having to stop it to find out — just
-      // reads the open session's start time, so it ticks forward for free on the existing 5-second refresh
-      // instead of needing its own timer to manage/clean up.
+      // Lets the employee see their running total on this task without having to stop it to find out — ticks
+      // forward for free on the existing 5-second refresh instead of needing its own timer to manage/clean up.
       if (obj.timerRunning){
         const openLog = [...obj.timeLogs].reverse().find(tl => !tl.stopTime);
         if (openLog && openLog.startTime){
-          const runningBadge = document.createElement('span'); runningBadge.style.fontSize = '13px'; runningBadge.style.color = 'var(--ink-muted)'; runningBadge.style.fontWeight = '600';
-          runningBadge.textContent = `⏱ ${elapsedLabel(openLog.startTime)}`;
+          const runningBadge = document.createElement('span'); runningBadge.style.fontSize = '39px'; runningBadge.style.color = 'var(--ink-muted)'; runningBadge.style.fontWeight = '700'; runningBadge.style.lineHeight = '1';
+          runningBadge.textContent = `⏱ ${cumulativeElapsedLabel(obj, person.id)}`;
           actions.appendChild(runningBadge);
         }
       }
@@ -5665,7 +5675,7 @@
       const supTimeInfo = document.createElement('span'); supTimeInfo.className = 'hint';
       if (runningEntry){
         const openLog = [...runningEntry.timeLogs].reverse().find(tl => !tl.stopTime);
-        supTimeInfo.textContent = openLog ? `Started ${openLog.startTime} — ⏱ ${elapsedLabel(openLog.startTime)}` : '';
+        supTimeInfo.textContent = openLog ? `Started ${openLog.startTime} — ⏱ ${cumulativeElapsedLabel(runningEntry, person.id)}` : '';
       }
       supRow.appendChild(supTimeInfo);
 
@@ -5699,7 +5709,7 @@
       const fmTimeInfo = document.createElement('span'); fmTimeInfo.className = 'hint';
       if (fmRunningEntry){
         const openLog = [...fmRunningEntry.timeLogs].reverse().find(tl => !tl.stopTime);
-        fmTimeInfo.textContent = openLog ? `Started ${openLog.startTime} — ⏱ ${elapsedLabel(openLog.startTime)}` : '';
+        fmTimeInfo.textContent = openLog ? `Started ${openLog.startTime} — ⏱ ${cumulativeElapsedLabel(fmRunningEntry, person.id)}` : '';
       }
       fmRow.appendChild(fmTimeInfo);
 
