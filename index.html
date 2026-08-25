@@ -6528,12 +6528,58 @@
     downloadCsv(rows, `${safeJob}_${c.taskName || 'task'}_${date}.csv`.replace(/[^a-z0-9\-_.]+/gi, '_'));
   }
 
+  // Archive needs real history for a date, not the schedule engine's own view of it — computeAllocationsByDate
+  // always simulates forward from today (state.meta.startDate is reset to today on every load), so it can
+  // never produce an allocation for a date before today at all, no matter how long ago that date actually
+  // was worked. This sources cards from what genuinely happened instead: a sign-off record, a real clocked
+  // timeLog, or a manual-add — any one of the three is enough for that (build, task) to count as a real card
+  // on this date, regardless of the engine's opinion of it.
+  function archiveCardsForDate(date){
+    const results = [];
+    state.jobRecords.forEach(jr => {
+      const build = state.builds.find(b => b.jobRecordId === jr.id);
+      if (!build) return;
+      (jr.tasks || []).forEach(t => {
+        const taskId = t.taskRefId;
+        if (!taskId) return;
+        const signedRec = (state.actuals[date] && state.actuals[date][build.id]) ? state.actuals[date][build.id][taskId] : null;
+        const manualEntries = [];
+        (t.subtasks || []).forEach(st => (st.manualAdds || []).forEach(m => { if (m.date === date) manualEntries.push(m); }));
+        const loggedHours = (t.subtasks || []).reduce((s, st) =>
+          s + (st.timeLogs || []).filter(tl => tl.date === date).reduce((ss, tl) => ss + logEntryHours(tl, st), 0), 0);
+        if (!signedRec && !manualEntries.length && loggedHours <= 0) return;
+
+        const eff = effectiveBuildData(build);
+        const task = state.tasks.find(x => x.id === taskId);
+        // Best-effort assignee for a historical card: whoever it was manually added for, else whoever logged
+        // the most time against it that day, else whoever the task is assigned to right now.
+        let personId = manualEntries.length ? manualEntries[0].personId : null;
+        if (!personId){
+          const counts = {};
+          (t.subtasks || []).forEach(st => (st.timeLogs || []).forEach(tl => { if (tl.date === date && tl.personId) counts[tl.personId] = (counts[tl.personId] || 0) + 1; }));
+          const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+          if (top) personId = top[0];
+        }
+        if (!personId && build.taskAssignments && build.taskAssignments[taskId]) personId = build.taskAssignments[taskId].personId || null;
+
+        results.push({
+          buildId: build.id, taskId, taskName: task ? task.name : jobTaskDisplayName(t),
+          jobNumber: eff.jobNumber, dealer: eff.dealer, customer: eff.customer, machineType: eff.machineType,
+          hours: signedRec ? signedRec.hours : Math.round(loggedHours * 100) / 100,
+          status: build.status, assignedPersonId: personId, secondaryPersonIds: [], date,
+          manualOnly: manualEntries.length > 0 && loggedHours <= 0 && !signedRec
+        });
+      });
+    });
+    return results;
+  }
+
   function renderArchivePage(){
     const container = document.getElementById('archiveSection');
     container.innerHTML = '';
 
     const panel = document.createElement('div'); panel.className = 'panel';
-    panel.innerHTML = '<h2>Archive</h2><div class="hint">Job cards for dates more than 2 days old — sign-off status shown per card, with a "Reactivate" undo if one needs correcting. Click a card\'s name to review its checklist. Filter below, or export.</div>';
+    panel.innerHTML = '<h2>Archive</h2><div class="hint">Every job card with real history — signed off, clocked time, or manually added — newest first. Sign-off status shown per card, with a "Reactivate" undo if one needs correcting. Click a card\'s name to review its checklist. Filter below, or export.</div>';
 
     const filterRow = document.createElement('div'); filterRow.className = 'field-row'; filterRow.style.marginTop = '10px'; filterRow.style.flexWrap = 'wrap';
     const fromLabel = document.createElement('label'); fromLabel.textContent = 'From';
@@ -6544,7 +6590,6 @@
     const toLabel = document.createElement('label'); toLabel.textContent = 'To';
     filterRow.appendChild(toLabel);
     const toInp = document.createElement('input'); toInp.type = 'date'; toInp.value = archiveFilters.to;
-    toInp.max = jobCardsArchiveCutoff();
     toInp.addEventListener('change', () => { archiveFilters.to = toInp.value; renderArchivePage(); });
     filterRow.appendChild(toInp);
 
@@ -6579,13 +6624,21 @@
 
     container.appendChild(panel);
 
-    const cutoff = jobCardsArchiveCutoff();
-    const allocByDate = computeAllocationsByDate();
-    // A manually-added task has no engine allocation, so its date wouldn't otherwise show up here at all.
-    const manualAddDates = new Set();
-    state.jobRecords.forEach(jr => (jr.tasks || []).forEach(t => (t.subtasks || []).forEach(st => (st.manualAdds || []).forEach(m => manualAddDates.add(m.date)))));
-    let archivedDates = Array.from(new Set([...allocByDate.keys(), ...state.adHocCards.map(c => c.date), ...manualAddDates]))
-      .filter(d => d < cutoff);
+    // Every date with real history — a sign-off, a clocked timeLog, or a manual-add — regardless of how
+    // recent it is (a card signed off minutes ago belongs here just as much as one from months back), plus
+    // any ad-hoc entry's own date.
+    const historyDates = new Set();
+    state.jobRecords.forEach(jr => (jr.tasks || []).forEach(t => (t.subtasks || []).forEach(st => {
+      (st.timeLogs || []).forEach(tl => { if (tl.date) historyDates.add(tl.date); });
+      (st.manualAdds || []).forEach(m => { if (m.date) historyDates.add(m.date); });
+    })));
+    Object.keys(state.actuals || {}).forEach(d => historyDates.add(d));
+    state.adHocCards.forEach(c => {
+      if (c.date) historyDates.add(c.date);
+      (c.timeLogs || []).forEach(tl => { if (tl.date) historyDates.add(tl.date); });
+    });
+
+    let archivedDates = Array.from(historyDates);
     if (archiveFilters.from) archivedDates = archivedDates.filter(d => d >= archiveFilters.from);
     if (archiveFilters.to) archivedDates = archivedDates.filter(d => d <= archiveFilters.to);
     archivedDates = archivedDates.sort((a, b) => a < b ? 1 : a > b ? -1 : 0);
@@ -6604,9 +6657,7 @@
     let anyShown = false;
 
     archivedDates.forEach(date => {
-      const engineCards = buildJobCardsForDate(date, allocByDate);
-      const engineKeys = new Set(engineCards.map(c => c.buildId + '|' + c.taskId));
-      const cards = engineCards.concat(manualOnlyCardsForDate(date).filter(c => !engineKeys.has(c.buildId + '|' + c.taskId))).filter(matchesFilters);
+      const cards = archiveCardsForDate(date).filter(matchesFilters);
       const adHoc = adHocCardsForDate(date).filter(c => !archiveFilters.jobNumber || (c.jobNumber || '').toLowerCase().includes(jobFilterLower))
         .filter(c => !archiveFilters.personId || c.personId === archiveFilters.personId);
       if (cards.length === 0 && adHoc.length === 0) return;
@@ -6677,7 +6728,7 @@
       const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
       empty.textContent = archiveFilters.from || archiveFilters.to || archiveFilters.personId || archiveFilters.jobNumber
         ? 'Nothing archived matches these filters.'
-        : 'Nothing archived yet — job cards land here once their date is more than 2 days in the past.';
+        : 'Nothing archived yet — job cards land here once there\'s a sign-off, clocked time, or a manual add against them.';
       panel.appendChild(empty);
     }
   }
