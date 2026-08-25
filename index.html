@@ -2125,11 +2125,18 @@
     // (same as any other partial sign-off) — the engine then has a real allocation for it too, which is fine,
     // but that allocation has no assignedPersonId of its own (nothing in taskAssignments put it there), so
     // without this it would silently drop off Sign-off's "assigned cards only" list the moment that happens.
+    // hasManualAdd is tagged onto BOTH branches and kept even once a real allocation exists, so a task doesn't
+    // fall out of its job's grouped sign-off row the moment it gets signed off — see renderSignoffPage.
     manualOnlyCardsForDate(date).forEach(mc => {
       const key = mc.buildId + '|' + mc.taskId;
       const existing = byKey.get(key);
-      if (existing){ if (!existing.assignedPersonId) existing.assignedPersonId = mc.assignedPersonId; }
-      else byKey.set(key, mc);
+      if (existing){
+        if (!existing.assignedPersonId) existing.assignedPersonId = mc.assignedPersonId;
+        existing.hasManualAdd = true;
+      } else {
+        mc.hasManualAdd = true;
+        byKey.set(key, mc);
+      }
     });
     return Array.from(byKey.values()).map(c => {
       const raw = state.builds.find(b => b.id === c.buildId);
@@ -2142,7 +2149,7 @@
         signedOff: !!signedRec, signedRec,
         actualHours: raw ? actualHoursFromJobCards(raw, c.taskId, date) : null,
         actualComplete: raw ? allJobCardSubtasksComplete(raw, c.taskId) : false,
-        manualOnly: !!c.manualOnly
+        manualOnly: !!c.hasManualAdd
       };
     });
   }
