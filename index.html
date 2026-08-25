@@ -6481,13 +6481,102 @@
   // here instead, grouped by date, most recent first. Same underlying data (buildJobCardsForDate) and the same
   // card-detail view — nothing is deleted or duplicated, this is just where old dates go to be looked back on. ----------
   const ARCHIVE_MAX_DAYS = 60;
+  // Persists across renders (not reset each time) so picking a filter doesn't clear itself on the next
+  // 5-second auto-refresh — same pattern as jobCardsView etc.
+  let archiveFilters = { from: '', to: '', personId: '', jobNumber: '' };
+
+  const ARCHIVE_CSV_HEADER = ['Date','Job #','Dealer','Customer','Machine type','Task','Assigned to','Status','Planned hours','Actual hours','Signed off','Signed off hours','Signed off complete'];
+
+  // One flat row of "everything about this card" — shared by the per-card export and the bulk date-range one.
+  function archiveCardCsvRow(c, date){
+    const person = state.people.find(p => p.id === c.assignedPersonId);
+    const raw = state.builds.find(b => b.id === c.buildId);
+    const signedRec = (state.actuals[date] && state.actuals[date][c.buildId]) ? state.actuals[date][c.buildId][c.taskId] : null;
+    const actualHours = raw ? actualHoursFromJobCards(raw, c.taskId, date) : null;
+    return [
+      date, c.jobNumber || '', c.dealer || '', c.customer || '', c.machineType || '', c.taskName || '',
+      person ? (person.name || '(unnamed)') : '(unassigned)', c.status || '', c.hours,
+      actualHours != null ? actualHours : '', signedRec ? 'Yes' : 'No', signedRec ? signedRec.hours : '',
+      signedRec ? (signedRec.complete ? 'Yes' : 'No') : ''
+    ];
+  }
+
+  function downloadCsv(rows, filename){
+    const csv = rows.map(r => r.map(csvField).join(',')).join('\n');
+    const blob = new Blob([csv], {type:'text/csv'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+  }
+
+  // One card's full detail — the flat summary row, then every sub-task it had with hours/completion — for the
+  // per-card export ("all information" for just this one card, not the whole date range).
+  function exportArchiveCard(c, date){
+    const rows = [ARCHIVE_CSV_HEADER, archiveCardCsvRow(c, date)];
+    const raw = state.builds.find(b => b.id === c.buildId);
+    const jrTask = jobCardSourceTask(raw, c.taskId);
+    const checklist = c.manualOnly && jrTask
+      ? jrTask.subtasks.filter(st => (st.manualAdds || []).some(m => m.personId === c.assignedPersonId && m.date === date))
+      : (jrTask ? jrTask.subtasks.filter(st => st.selected) : []);
+    if (checklist.length){
+      rows.push([]);
+      rows.push(['Sub-task #', 'Sub-task name', 'Hours', 'Completed']);
+      checklist.forEach(st => rows.push([st.number || '', st.name || '', st.standardTime, st.completed ? 'Yes' : 'No']));
+    }
+    const safeJob = (c.jobNumber || 'job').replace(/[^a-z0-9\-_]+/gi, '_');
+    downloadCsv(rows, `${safeJob}_${c.taskName || 'task'}_${date}.csv`.replace(/[^a-z0-9\-_.]+/gi, '_'));
+  }
 
   function renderArchivePage(){
     const container = document.getElementById('archiveSection');
     container.innerHTML = '';
 
     const panel = document.createElement('div'); panel.className = 'panel';
-    panel.innerHTML = '<h2>Archive</h2><div class="hint">Job cards for dates more than 2 days old — read-only history. Click a card to review its checklist and who it was assigned to.</div>';
+    panel.innerHTML = '<h2>Archive</h2><div class="hint">Job cards for dates more than 2 days old — sign-off status shown per card, with a "Reactivate" undo if one needs correcting. Click a card\'s name to review its checklist. Filter below, or export.</div>';
+
+    const filterRow = document.createElement('div'); filterRow.className = 'field-row'; filterRow.style.marginTop = '10px'; filterRow.style.flexWrap = 'wrap';
+    const fromLabel = document.createElement('label'); fromLabel.textContent = 'From';
+    filterRow.appendChild(fromLabel);
+    const fromInp = document.createElement('input'); fromInp.type = 'date'; fromInp.value = archiveFilters.from;
+    fromInp.addEventListener('change', () => { archiveFilters.from = fromInp.value; renderArchivePage(); });
+    filterRow.appendChild(fromInp);
+    const toLabel = document.createElement('label'); toLabel.textContent = 'To';
+    filterRow.appendChild(toLabel);
+    const toInp = document.createElement('input'); toInp.type = 'date'; toInp.value = archiveFilters.to;
+    toInp.max = jobCardsArchiveCutoff();
+    toInp.addEventListener('change', () => { archiveFilters.to = toInp.value; renderArchivePage(); });
+    filterRow.appendChild(toInp);
+
+    const personLabel = document.createElement('label'); personLabel.textContent = 'Employee';
+    filterRow.appendChild(personLabel);
+    const personSel = document.createElement('select');
+    const anyPersonOpt = document.createElement('option'); anyPersonOpt.value = ''; anyPersonOpt.textContent = '— Any —';
+    personSel.appendChild(anyPersonOpt);
+    sortedPeople().forEach(p => {
+      const opt = document.createElement('option'); opt.value = p.id; opt.textContent = p.name || '(unnamed)';
+      if (p.id === archiveFilters.personId) opt.selected = true;
+      personSel.appendChild(opt);
+    });
+    personSel.addEventListener('change', () => { archiveFilters.personId = personSel.value; renderArchivePage(); });
+    filterRow.appendChild(personSel);
+
+    const jobLabel = document.createElement('label'); jobLabel.textContent = 'Job #';
+    filterRow.appendChild(jobLabel);
+    const jobInp = document.createElement('input'); jobInp.type = 'text'; jobInp.placeholder = 'e.g. JB-1042'; jobInp.value = archiveFilters.jobNumber;
+    jobInp.addEventListener('input', () => { archiveFilters.jobNumber = jobInp.value; renderArchivePage(); });
+    filterRow.appendChild(jobInp);
+
+    const clearBtn = document.createElement('button'); clearBtn.className = 'ghost icon';
+    clearBtn.textContent = 'Clear filters';
+    clearBtn.addEventListener('click', () => { archiveFilters = { from: '', to: '', personId: '', jobNumber: '' }; renderArchivePage(); });
+    filterRow.appendChild(clearBtn);
+    panel.appendChild(filterRow);
+
+    const exportAllBtn = document.createElement('button'); exportAllBtn.className = 'ghost icon'; exportAllBtn.style.marginTop = '10px';
+    exportAllBtn.textContent = 'Export filtered date range (CSV)';
+    panel.appendChild(exportAllBtn);
+
     container.appendChild(panel);
 
     const cutoff = jobCardsArchiveCutoff();
@@ -6495,41 +6584,72 @@
     // A manually-added task has no engine allocation, so its date wouldn't otherwise show up here at all.
     const manualAddDates = new Set();
     state.jobRecords.forEach(jr => (jr.tasks || []).forEach(t => (t.subtasks || []).forEach(st => (st.manualAdds || []).forEach(m => manualAddDates.add(m.date)))));
-    const archivedDates = Array.from(new Set([...allocByDate.keys(), ...state.adHocCards.map(c => c.date), ...manualAddDates]))
-      .filter(d => d < cutoff)
-      .sort((a, b) => a < b ? 1 : a > b ? -1 : 0)
-      .slice(0, ARCHIVE_MAX_DAYS);
+    let archivedDates = Array.from(new Set([...allocByDate.keys(), ...state.adHocCards.map(c => c.date), ...manualAddDates]))
+      .filter(d => d < cutoff);
+    if (archiveFilters.from) archivedDates = archivedDates.filter(d => d >= archiveFilters.from);
+    if (archiveFilters.to) archivedDates = archivedDates.filter(d => d <= archiveFilters.to);
+    archivedDates = archivedDates.sort((a, b) => a < b ? 1 : a > b ? -1 : 0);
+    // Only cap how many days render when nothing's narrowed the range down — an explicit filter means the
+    // manager deliberately wants that whole range, however long.
+    if (!archiveFilters.from && !archiveFilters.to) archivedDates = archivedDates.slice(0, ARCHIVE_MAX_DAYS);
 
-    if (archivedDates.length === 0){
-      const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
-      empty.textContent = 'Nothing archived yet — job cards land here once their date is more than 2 days in the past.';
-      panel.appendChild(empty);
-      return;
-    }
+    const jobFilterLower = archiveFilters.jobNumber.trim().toLowerCase();
+    const matchesFilters = c => {
+      if (archiveFilters.personId && c.assignedPersonId !== archiveFilters.personId) return false;
+      if (jobFilterLower && !(c.jobNumber || '').toLowerCase().includes(jobFilterLower)) return false;
+      return true;
+    };
+
+    const allExportRows = [ARCHIVE_CSV_HEADER];
+    let anyShown = false;
 
     archivedDates.forEach(date => {
       const engineCards = buildJobCardsForDate(date, allocByDate);
       const engineKeys = new Set(engineCards.map(c => c.buildId + '|' + c.taskId));
-      const cards = engineCards.concat(manualOnlyCardsForDate(date).filter(c => !engineKeys.has(c.buildId + '|' + c.taskId)));
-      const adHoc = adHocCardsForDate(date);
+      const cards = engineCards.concat(manualOnlyCardsForDate(date).filter(c => !engineKeys.has(c.buildId + '|' + c.taskId))).filter(matchesFilters);
+      const adHoc = adHocCardsForDate(date).filter(c => !archiveFilters.jobNumber || (c.jobNumber || '').toLowerCase().includes(jobFilterLower))
+        .filter(c => !archiveFilters.personId || c.personId === archiveFilters.personId);
       if (cards.length === 0 && adHoc.length === 0) return;
+      anyShown = true;
 
       const datePanel = document.createElement('div'); datePanel.className = 'panel'; datePanel.style.marginTop = '12px';
       datePanel.innerHTML = `<h2>${fmtDateLong(date)}</h2>`;
       const list = document.createElement('div'); list.className = 'drill-list'; list.style.marginTop = '10px';
       cards.forEach(c => {
-        const row = document.createElement('div'); row.className = 'drill-row';
-        const main = document.createElement('div'); main.className = 'drill-main';
+        allExportRows.push(archiveCardCsvRow(c, date));
+        const signedRec = (state.actuals[date] && state.actuals[date][c.buildId]) ? state.actuals[date][c.buildId][c.taskId] : null;
+        const row = document.createElement('div'); row.className = 'drill-row'; row.style.cursor = 'default';
+        const main = document.createElement('div'); main.className = 'drill-main'; main.style.cursor = 'pointer';
         main.textContent = `${jobIdentityLabel(c.jobNumber, c.dealer, c.customer)} — ${c.taskName}`;
-        row.appendChild(main);
-        const meta = document.createElement('div'); meta.className = 'drill-meta';
-        const assignedPerson = state.people.find(p => p.id === c.assignedPersonId);
-        meta.textContent = `${c.machineType || ''} · ${c.hours}h · ${c.status || 'scheduled'}${assignedPerson ? ' · ' + assignedPerson.name : ''} ›`;
-        row.appendChild(meta);
-        row.addEventListener('click', () => {
+        main.addEventListener('click', () => {
           jobCardsView.level = 'card'; jobCardsView.cardBuildId = c.buildId; jobCardsView.cardTaskId = c.taskId; jobCardsView.cardDate = c.date;
           showPage('jobcards');
         });
+        row.appendChild(main);
+        const rightWrap = document.createElement('div'); rightWrap.style.display = 'flex'; rightWrap.style.alignItems = 'center'; rightWrap.style.gap = '10px';
+        const meta = document.createElement('div'); meta.className = 'drill-meta';
+        const assignedPerson = state.people.find(p => p.id === c.assignedPersonId);
+        meta.textContent = `${c.machineType || ''} · ${c.hours}h · ${c.status || 'scheduled'}${assignedPerson ? ' · ' + assignedPerson.name : ''}`;
+        rightWrap.appendChild(meta);
+        const signPill = document.createElement('span'); signPill.className = 'pill ' + (signedRec ? 'ok' : 'stuck');
+        signPill.textContent = signedRec ? `Signed off — ${signedRec.hours}h` : 'Not signed off';
+        rightWrap.appendChild(signPill);
+        if (signedRec){
+          const reactivateBtn = document.createElement('button'); reactivateBtn.className = 'ghost icon';
+          reactivateBtn.textContent = '↩ Reactivate';
+          reactivateBtn.title = 'Undo this sign-off — sends it back to Sign Off as pending.';
+          reactivateBtn.addEventListener('click', () => {
+            if (!confirm(`Undo the sign-off for ${jobIdentityLabel(c.jobNumber, c.dealer, c.customer)} — ${c.taskName} on ${fmtDateLong(date)}?`)) return;
+            undoSignOffCard(date, c.buildId, c.taskId);
+            renderArchivePage(); renderSignoffFab();
+          });
+          rightWrap.appendChild(reactivateBtn);
+        }
+        const exportBtn = document.createElement('button'); exportBtn.className = 'icon ghost'; exportBtn.textContent = '⤓';
+        exportBtn.title = 'Export this card (CSV)';
+        exportBtn.addEventListener('click', () => exportArchiveCard(c, date));
+        rightWrap.appendChild(exportBtn);
+        row.appendChild(rightWrap);
         list.appendChild(row);
       });
       adHoc.forEach(c => {
@@ -6546,6 +6666,20 @@
       datePanel.appendChild(list);
       container.appendChild(datePanel);
     });
+
+    exportAllBtn.addEventListener('click', () => {
+      if (allExportRows.length <= 1){ alert('Nothing matches the current filters to export.'); return; }
+      const rangeLabel = (archiveFilters.from || 'start') + '_to_' + (archiveFilters.to || 'now');
+      downloadCsv(allExportRows, `archive_${rangeLabel}.csv`.replace(/[^a-z0-9\-_.]+/gi, '_'));
+    });
+
+    if (!anyShown){
+      const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
+      empty.textContent = archiveFilters.from || archiveFilters.to || archiveFilters.personId || archiveFilters.jobNumber
+        ? 'Nothing archived matches these filters.'
+        : 'Nothing archived yet — job cards land here once their date is more than 2 days in the past.';
+      panel.appendChild(empty);
+    }
   }
 
   // ---------- Reports: a list of jobs, newest to oldest, each expanding into its full logged-time breakdown —
