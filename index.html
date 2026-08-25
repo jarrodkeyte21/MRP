@@ -997,6 +997,18 @@
     document.getElementById('authHint').textContent = message || 'Ask your manager for a login if you don\'t have one yet.';
   }
 
+  // Whoever's actually logged in and performing an action right now — a floor login maps straight to their
+  // own person record, a manager falls back to their login email since managers aren't necessarily linked to
+  // a person at all. Used to tag work added manually (not part of the normal schedule) with who added it.
+  function currentActorName(){
+    if (currentProfile && currentProfile.person_id){
+      const p = state.people.find(x => x.id === currentProfile.person_id);
+      if (p) return p.name || '(unnamed)';
+    }
+    if (currentSession && currentSession.user && currentSession.user.email) return currentSession.user.email;
+    return 'Unknown';
+  }
+
   function applyRoleUI(){
     const role = currentProfile ? currentProfile.role : null;
     const isManager = role === 'manager';
@@ -4285,7 +4297,8 @@
             const task = state.tasks.find(x => x.id === t.taskRefId);
             results.push({
               buildId: build.id, taskId: t.taskRefId, taskName: task ? task.name : jobTaskDisplayName(t),
-              jobNumber: eff.jobNumber, dealer: eff.dealer, customer: eff.customer, subtask: st, manualAddId: m.id
+              jobNumber: eff.jobNumber, dealer: eff.dealer, customer: eff.customer, machineType: eff.machineType,
+              subtask: st, manualAddId: m.id, addedBy: m.addedBy || null
             });
           });
         });
@@ -4975,26 +4988,44 @@
     // A sub-task added via "Add task manually" below (or the floor's own "Add work to this card") — a real
     // task on this person's card for this date, just not clocked on yet. Skipped for a (build, task) already
     // listed above via `cards` — that's the same task shown a different way (tick its checkbox to assign it),
-    // not a second thing to add.
+    // not a second thing to add. Grouped by job — one heading per job, every manually-added task underneath —
+    // same as the employee's own Job Card groups them, rather than repeating the job name on every row.
     const cardKeys = new Set(cards.map(c => c.buildId + '|' + c.taskId));
+    const manualByBuild = new Map();
     manualSubs.filter(m => !cardKeys.has(m.buildId + '|' + m.taskId)).forEach(m => {
-      const row = document.createElement('div'); row.className = 'drill-row'; row.style.marginTop = '6px';
-      const main = document.createElement('div'); main.className = 'drill-main';
-      main.textContent = `${jobIdentityLabel(m.jobNumber, m.dealer, m.customer)} — ${m.taskName}: ${m.subtask.name}`;
-      row.appendChild(main);
-      const rightWrap = document.createElement('div'); rightWrap.style.display = 'flex'; rightWrap.style.alignItems = 'center'; rightWrap.style.gap = '10px';
-      const meta = document.createElement('div'); meta.className = 'drill-meta';
-      meta.textContent = `${m.subtask.standardTime}h · added`;
-      rightWrap.appendChild(meta);
-      const removeBtn = document.createElement('button'); removeBtn.className = 'icon ghost'; removeBtn.textContent = '✕';
-      removeBtn.title = 'Remove — takes it off this person\'s card for this date.';
-      removeBtn.addEventListener('click', () => {
-        m.subtask.manualAdds = (m.subtask.manualAdds || []).filter(x => x.id !== m.manualAddId);
-        save(); renderJobCardsPage();
+      if (!manualByBuild.has(m.buildId)) manualByBuild.set(m.buildId, []);
+      manualByBuild.get(m.buildId).push(m);
+    });
+    manualByBuild.forEach(items => {
+      const jobRow = document.createElement('div'); jobRow.className = 'drill-row'; jobRow.style.marginTop = '6px'; jobRow.style.background = 'var(--bg)';
+      const jobMain = document.createElement('div'); jobMain.className = 'drill-main';
+      jobMain.textContent = jobIdentityLabel(items[0].jobNumber, items[0].dealer, items[0].customer);
+      jobRow.appendChild(jobMain);
+      const jobMeta = document.createElement('div'); jobMeta.className = 'drill-meta';
+      const jobHours = items.reduce((s, m) => s + (Number(m.subtask.standardTime) || 0), 0);
+      jobMeta.textContent = `${items.length} task${items.length === 1 ? '' : 's'} added — ${jobHours}h`;
+      jobRow.appendChild(jobMeta);
+      groupWrap.appendChild(jobRow);
+
+      items.forEach(m => {
+        const row = document.createElement('div'); row.className = 'drill-row'; row.style.marginTop = '4px'; row.style.paddingLeft = '20px';
+        const main = document.createElement('div'); main.className = 'drill-main';
+        main.textContent = `${m.taskName}: ${m.subtask.name}`;
+        row.appendChild(main);
+        const rightWrap = document.createElement('div'); rightWrap.style.display = 'flex'; rightWrap.style.alignItems = 'center'; rightWrap.style.gap = '10px';
+        const meta = document.createElement('div'); meta.className = 'drill-meta';
+        meta.textContent = `${m.subtask.standardTime}h${m.addedBy ? ' · added by ' + m.addedBy : ' · added'}`;
+        rightWrap.appendChild(meta);
+        const removeBtn = document.createElement('button'); removeBtn.className = 'icon ghost'; removeBtn.textContent = '✕';
+        removeBtn.title = 'Remove — takes it off this person\'s card for this date.';
+        removeBtn.addEventListener('click', () => {
+          m.subtask.manualAdds = (m.subtask.manualAdds || []).filter(x => x.id !== m.manualAddId);
+          save(); renderJobCardsPage();
+        });
+        rightWrap.appendChild(removeBtn);
+        row.appendChild(rightWrap);
+        groupWrap.appendChild(row);
       });
-      rightWrap.appendChild(removeBtn);
-      row.appendChild(rightWrap);
-      groupWrap.appendChild(row);
     });
 
     // This day's card list above only ever shows work the schedule engine actually allocated to `date` — a
@@ -5186,7 +5217,7 @@
         if (!subtask){ alert('Could not find that sub-task — try reselecting Job/Task.'); return; }
         if (!Array.isArray(subtask.manualAdds)) subtask.manualAdds = [];
         if (!subtask.manualAdds.some(m => m.personId === person.id && m.date === date)){
-          subtask.manualAdds.push({ id: uid('madd'), personId: person.id, date });
+          subtask.manualAdds.push({ id: uid('madd'), personId: person.id, date, addedBy: currentActorName() });
         }
         save(); onAdd();
         return;
@@ -5795,9 +5826,8 @@
       const assignment = raw.taskAssignments[c.taskId];
       // A pulled card's hours/checklist slice belongs to its real scheduled date, not the date it's been
       // pulled forward/back onto for display — using the wrong date here throws off which sub-tasks are in
-      // that slice's window (see checklistForCard). A manual-only card (c.manualOnly) has no engine allocation
-      // to window against at all — skip straight to just what was manually added.
-      const checklist = c.manualOnly ? [] : checklistForCard(jrTask, assignment, c.buildId, c.taskId, c.hours, pulled ? c.pulledFromDate : date);
+      // that slice's window (see checklistForCard).
+      const checklist = checklistForCard(jrTask, assignment, c.buildId, c.taskId, c.hours, pulled ? c.pulledFromDate : date);
       const checklistIds = new Set(checklist.map(st => st.id));
       manualGroupKeysUsed.add(c.buildId + '|' + c.taskId);
       const manualForThisTask = manualSubs.filter(m => m.buildId === c.buildId && m.taskId === c.taskId && !checklistIds.has(m.subtask.id));
@@ -5851,6 +5881,7 @@
       // else, instead of a separate list) — "Remove" only clears the manual-add tag, never the sub-task itself.
       const manualRows = manualForThisTask.map(m => ({
         obj: m.subtask, number: m.subtask.number, name: m.subtask.name, notes: m.subtask.notes, time: m.subtask.standardTime + 'h',
+        prefix: m.addedBy ? `Added by ${m.addedBy}` : 'Added manually',
         onDelete: () => {
           m.subtask.manualAdds = (m.subtask.manualAdds || []).filter(x => x.id !== m.manualAddId);
           save(); renderJobCardsLivePage();
@@ -5884,24 +5915,51 @@
     pulledTasks.forEach(c => renderTaskCard(c, true));
 
     // A sub-task picked via "Add work to this card" for a job/task already covered above just rode along on
-    // that same card (see manualGroupKeysUsed). Whatever's left is a task nobody's otherwise working today —
-    // give it its own card, grouped under its job number exactly like a normal scheduled task, rather than a
-    // separate flat list.
-    const manualOnlyKeys = new Set(manualSubs.map(m => m.buildId + '|' + m.taskId));
-    manualOnlyKeys.forEach(key => {
+    // that same card (see manualGroupKeysUsed). Whatever's left is grouped by job — one card per job, every
+    // manually-added task on it as its own section underneath — the same way the Jobs tab groups a job's tasks
+    // together, rather than a separate job-number-headed card repeated for each task.
+    const manualOnlyByBuild = new Map();
+    manualSubs.forEach(m => {
+      const key = m.buildId + '|' + m.taskId;
       if (manualGroupKeysUsed.has(key)) return;
-      const [buildId, taskId] = key.split('|');
+      if (!manualOnlyByBuild.has(m.buildId)) manualOnlyByBuild.set(m.buildId, new Map());
+      const byTask = manualOnlyByBuild.get(m.buildId);
+      if (!byTask.has(m.taskId)) byTask.set(m.taskId, []);
+      byTask.get(m.taskId).push(m);
+    });
+    manualOnlyByBuild.forEach((byTask, buildId) => {
       const build = state.builds.find(b => b.id === buildId);
       if (!build) return;
       const eff = effectiveBuildData(build);
-      const task = state.tasks.find(t => t.id === taskId);
-      const hours = manualSubs.filter(m => m.buildId === buildId && m.taskId === taskId)
-        .reduce((sum, m) => sum + (Number(m.subtask.standardTime) || 0), 0);
-      renderTaskCard({
-        buildId, taskId, taskName: task ? task.name : '(task)',
-        jobNumber: eff.jobNumber, dealer: eff.dealer, customer: eff.customer, machineType: eff.machineType,
-        hours, status: build.status, manualOnly: true
-      }, false);
+
+      const cardPanel = document.createElement('div'); cardPanel.className = 'panel'; cardPanel.style.marginTop = '10px';
+      const titleRow = document.createElement('div'); titleRow.className = 'taskcard-head';
+      const jobNumEl = document.createElement('div'); jobNumEl.className = 'taskcard-jobnum'; jobNumEl.textContent = eff.jobNumber || '(no job #)';
+      titleRow.appendChild(jobNumEl);
+      const machineEl = document.createElement('div'); machineEl.className = 'taskcard-machine'; machineEl.textContent = eff.machineType || '—';
+      titleRow.appendChild(machineEl);
+      const dealerEl = document.createElement('div'); dealerEl.className = 'taskcard-dealer';
+      dealerEl.textContent = [eff.dealer, eff.customer].filter(Boolean).join(' / ') || '—';
+      titleRow.appendChild(dealerEl);
+      cardPanel.appendChild(titleRow);
+
+      byTask.forEach((items, taskId) => {
+        const task = state.tasks.find(t => t.id === taskId);
+        const taskNameEl = document.createElement('div'); taskNameEl.className = 'taskcard-taskname'; taskNameEl.style.marginTop = '8px';
+        taskNameEl.textContent = task ? task.name : '(task)';
+        cardPanel.appendChild(taskNameEl);
+        subtaskHoursTotal += items.reduce((sum, m) => sum + (Number(m.subtask.standardTime) || 0), 0);
+        cardPanel.appendChild(renderSubtaskTimerTable(items.map(m => ({
+          obj: m.subtask, number: m.subtask.number, name: m.subtask.name, notes: m.subtask.notes, time: m.subtask.standardTime + 'h',
+          prefix: m.addedBy ? `Added by ${m.addedBy}` : 'Added manually',
+          onDelete: () => {
+            m.subtask.manualAdds = (m.subtask.manualAdds || []).filter(x => x.id !== m.manualAddId);
+            save(); renderJobCardsLivePage();
+          }
+        })), person, date));
+      });
+
+      container.appendChild(cardPanel);
     });
 
     // Supervision and Factory Maintenance / Lost Time entries each get their own Start/Stop control (top of
