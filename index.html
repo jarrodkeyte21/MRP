@@ -2120,9 +2120,18 @@
   function activeCardsForSignoff(date){
     const allocByDate = computeAllocationsByDate();
     const engineCards = buildJobCardsForDate(date, allocByDate);
-    const engineKeys = new Set(engineCards.map(c => c.buildId + '|' + c.taskId));
-    const manualCards = manualOnlyCardsForDate(date).filter(c => !engineKeys.has(c.buildId + '|' + c.taskId));
-    return engineCards.concat(manualCards).map(c => {
+    const byKey = new Map(engineCards.map(c => [c.buildId + '|' + c.taskId, c]));
+    // A manually-added task signed off as "not complete" gets topped up by the scheduler's own top-up pass
+    // (same as any other partial sign-off) — the engine then has a real allocation for it too, which is fine,
+    // but that allocation has no assignedPersonId of its own (nothing in taskAssignments put it there), so
+    // without this it would silently drop off Sign-off's "assigned cards only" list the moment that happens.
+    manualOnlyCardsForDate(date).forEach(mc => {
+      const key = mc.buildId + '|' + mc.taskId;
+      const existing = byKey.get(key);
+      if (existing){ if (!existing.assignedPersonId) existing.assignedPersonId = mc.assignedPersonId; }
+      else byKey.set(key, mc);
+    });
+    return Array.from(byKey.values()).map(c => {
       const raw = state.builds.find(b => b.id === c.buildId);
       const person = state.people.find(p => p.id === c.assignedPersonId);
       const signedRec = (state.actuals[date] && state.actuals[date][c.buildId]) ? state.actuals[date][c.buildId][c.taskId] : null;
@@ -2185,8 +2194,103 @@
       return;
     }
 
+    // Builds the checklist table + hours/complete/sign-off form for one task — shared by a normal single-task
+    // row and by each task section inside a grouped manual-only job row below.
+    function renderSignoffDetail(c){
+      const detail = document.createElement('div'); detail.className = 'signoff-row-detail';
+      detail.addEventListener('click', (e) => e.stopPropagation());
+
+      const raw = state.builds.find(b => b.id === c.buildId);
+      const jrTask = jobCardSourceTask(raw, c.taskId);
+      const assignment = raw ? raw.taskAssignments[c.taskId] : null;
+      // A manual-only card (no engine allocation at all) has nothing real to window checklistForCard's hour
+      // range against — show exactly the sub-tasks that were manually added for this person/date instead.
+      const checklist = c.manualOnly
+        ? (jrTask ? jrTask.subtasks.filter(st => (st.manualAdds || []).some(m => m.personId === c.personId && m.date === date)) : [])
+        : checklistForCard(jrTask, assignment, c.buildId, c.taskId, c.planned, date);
+
+      if (checklist.length === 0){
+        const noChecklist = document.createElement('div'); noChecklist.className = 'dep-empty';
+        noChecklist.textContent = 'No checklist for this task — just the hours below.';
+        detail.appendChild(noChecklist);
+      } else {
+        const table = document.createElement('table'); table.className = 'editor'; table.style.marginBottom = '10px';
+        table.innerHTML = '<thead><tr><th>Sub-task</th><th style="width:70px">Time used</th><th style="width:80px">Completed</th></tr></thead>';
+        const tbody = document.createElement('tbody');
+        checklist.forEach(st => {
+          const tr = document.createElement('tr');
+          const tdName = document.createElement('td'); tdName.textContent = (st.number ? st.number + ' — ' : '') + st.name; tr.appendChild(tdName);
+          const tdUsed = document.createElement('td'); tdUsed.textContent = totalTimeUsedHours(st) + 'h'; tr.appendChild(tdUsed);
+          const tdDone = document.createElement('td'); tdDone.textContent = st.completed ? '✓' : '—'; tr.appendChild(tdDone);
+          tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        detail.appendChild(table);
+      }
+
+      const formRow = document.createElement('div'); formRow.style.display = 'flex'; formRow.style.alignItems = 'center'; formRow.style.gap = '10px'; formRow.style.flexWrap = 'wrap';
+      const hoursLabel = document.createElement('label'); hoursLabel.style.display = 'flex'; hoursLabel.style.alignItems = 'center'; hoursLabel.style.gap = '4px';
+      hoursLabel.append('Hours: ');
+      const defaultHours = c.signedOff ? c.signedRec.hours : (c.actualHours != null ? c.actualHours : c.planned);
+      const hoursInp = makeHourInput(defaultHours, () => {});
+      hoursLabel.appendChild(hoursInp);
+      formRow.appendChild(hoursLabel);
+
+      const completeLabel = document.createElement('label'); completeLabel.style.display = 'flex'; completeLabel.style.alignItems = 'center'; completeLabel.style.gap = '4px';
+      const completeCb = document.createElement('input'); completeCb.type = 'checkbox';
+      completeCb.checked = c.signedOff ? c.signedRec.complete : c.actualComplete;
+      completeLabel.appendChild(completeCb); completeLabel.append('Complete');
+      formRow.appendChild(completeLabel);
+
+      const signBtn = document.createElement('button'); signBtn.className = 'primary'; signBtn.style.padding = '4px 10px'; signBtn.style.fontSize = '11.5px';
+      signBtn.textContent = c.signedOff ? 'Update sign-off' : 'Sign off';
+      signBtn.disabled = !c.signedOff && !c.dayFinished;
+      signBtn.title = signBtn.disabled ? `Waiting on ${c.personName} to mark their time card "Day finished" before this can be signed off.` : '';
+      signBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        signOffCard(date, c.buildId, c.taskId, Number(hoursInp.value) || 0, completeCb.checked);
+        renderSignoffPage(); renderSignoffFab();
+        if (document.getElementById('page-schedule').style.display !== 'none') renderResults();
+      });
+      formRow.appendChild(signBtn);
+
+      if (c.signedOff){
+        const undoBtn = document.createElement('button'); undoBtn.className = 'ghost'; undoBtn.style.padding = '4px 10px'; undoBtn.style.fontSize = '11.5px';
+        undoBtn.textContent = 'Undo sign off';
+        undoBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          undoSignOffCard(date, c.buildId, c.taskId);
+          renderSignoffPage(); renderSignoffFab();
+          if (document.getElementById('page-schedule').style.display !== 'none') renderResults();
+        });
+        formRow.appendChild(undoBtn);
+      }
+
+      const planTxt = document.createElement('div'); planTxt.className = 'drill-sub'; planTxt.style.width = '100%'; planTxt.style.marginTop = '2px';
+      planTxt.textContent = `Planned: ${c.planned}h${c.actualHours != null ? ' · Job Cards clock data: ' + c.actualHours + 'h' : ' · no Job Cards clock data yet'}`;
+      formRow.appendChild(planTxt);
+
+      detail.appendChild(formRow);
+      return detail;
+    }
+
     const list = document.createElement('div'); list.style.marginTop = '10px';
+
+    // Manually-added tasks for the same job (and same person) are grouped into one row — matching how they
+    // already appear grouped under one job card on the employee's own Job Card — with each task's own
+    // checklist/sign-off form nested underneath once expanded, rather than one separate row per task. Real
+    // engine-scheduled cards keep their existing one-row-per-task layout untouched.
+    const manualGroupOrder = [];
+    const manualGroups = new Map();
+    const singleCards = [];
     cards.forEach(c => {
+      if (!c.manualOnly){ singleCards.push(c); return; }
+      const gkey = c.buildId + '|' + c.personId;
+      if (!manualGroups.has(gkey)){ manualGroups.set(gkey, []); manualGroupOrder.push(gkey); }
+      manualGroups.get(gkey).push(c);
+    });
+
+    singleCards.forEach(c => {
       const key = c.buildId + '|' + c.taskId;
       const expanded = signoffExpanded.has(key);
       const rowWrap = document.createElement('div'); rowWrap.className = 'signoff-row';
@@ -2228,85 +2332,72 @@
       });
       rowWrap.appendChild(main);
 
-      if (expanded){
-        const detail = document.createElement('div'); detail.className = 'signoff-row-detail';
-        detail.addEventListener('click', (e) => e.stopPropagation());
+      if (expanded) rowWrap.appendChild(renderSignoffDetail(c));
+      list.appendChild(rowWrap);
+    });
 
-        const raw = state.builds.find(b => b.id === c.buildId);
-        const jrTask = jobCardSourceTask(raw, c.taskId);
-        const assignment = raw ? raw.taskAssignments[c.taskId] : null;
-        // A manual-only card (no engine allocation at all) has nothing real to window checklistForCard's hour
-        // range against — show exactly the sub-tasks that were manually added for this person/date instead.
-        const checklist = c.manualOnly
-          ? (jrTask ? jrTask.subtasks.filter(st => (st.manualAdds || []).some(m => m.personId === c.personId && m.date === date)) : [])
-          : checklistForCard(jrTask, assignment, c.buildId, c.taskId, c.planned, date);
+    manualGroupOrder.forEach(gkey => {
+      const group = manualGroups.get(gkey);
+      const first = group[0];
+      const groupKey = 'group|' + gkey;
+      const expanded = signoffExpanded.has(groupKey);
+      const rowWrap = document.createElement('div'); rowWrap.className = 'signoff-row';
+      const anyPending = group.some(c => !c.dayFinished && !c.signedOff);
+      if (anyPending) rowWrap.style.opacity = '0.5';
 
-        if (checklist.length === 0){
-          const noChecklist = document.createElement('div'); noChecklist.className = 'dep-empty';
-          noChecklist.textContent = 'No checklist for this task — just the hours below.';
-          detail.appendChild(noChecklist);
-        } else {
-          const table = document.createElement('table'); table.className = 'editor'; table.style.marginBottom = '10px';
-          table.innerHTML = '<thead><tr><th>Sub-task</th><th style="width:70px">Time used</th><th style="width:80px">Completed</th></tr></thead>';
-          const tbody = document.createElement('tbody');
-          checklist.forEach(st => {
-            const tr = document.createElement('tr');
-            const tdName = document.createElement('td'); tdName.textContent = (st.number ? st.number + ' — ' : '') + st.name; tr.appendChild(tdName);
-            const tdUsed = document.createElement('td'); tdUsed.textContent = totalTimeUsedHours(st) + 'h'; tr.appendChild(tdUsed);
-            const tdDone = document.createElement('td'); tdDone.textContent = st.completed ? '✓' : '—'; tr.appendChild(tdDone);
-            tbody.appendChild(tr);
-          });
-          table.appendChild(tbody);
-          detail.appendChild(table);
-        }
+      const main = document.createElement('div'); main.className = 'signoff-row-main';
+      const left = document.createElement('div');
+      left.innerHTML = `<div style="font-weight:600">${jobIdentityLabel(first.jobNumber, first.dealer, first.customer)} — ${group.length} task${group.length === 1 ? '' : 's'} added</div>
+        <div class="drill-sub">${first.personName}${first.dayFinished ? ' · ✓ Day finished' : ''}</div>`;
+      main.appendChild(left);
 
-        const formRow = document.createElement('div'); formRow.style.display = 'flex'; formRow.style.alignItems = 'center'; formRow.style.gap = '10px'; formRow.style.flexWrap = 'wrap';
-        const hoursLabel = document.createElement('label'); hoursLabel.style.display = 'flex'; hoursLabel.style.alignItems = 'center'; hoursLabel.style.gap = '4px';
-        hoursLabel.append('Hours: ');
-        const defaultHours = c.signedOff ? c.signedRec.hours : (c.actualHours != null ? c.actualHours : c.planned);
-        const hoursInp = makeHourInput(defaultHours, () => {});
-        hoursLabel.appendChild(hoursInp);
-        formRow.appendChild(hoursLabel);
-
-        const completeLabel = document.createElement('label'); completeLabel.style.display = 'flex'; completeLabel.style.alignItems = 'center'; completeLabel.style.gap = '4px';
-        const completeCb = document.createElement('input'); completeCb.type = 'checkbox';
-        completeCb.checked = c.signedOff ? c.signedRec.complete : c.actualComplete;
-        completeLabel.appendChild(completeCb); completeLabel.append('Complete');
-        formRow.appendChild(completeLabel);
-
-        const signBtn = document.createElement('button'); signBtn.className = 'primary'; signBtn.style.padding = '4px 10px'; signBtn.style.fontSize = '11.5px';
-        signBtn.textContent = c.signedOff ? 'Update sign-off' : 'Sign off';
-        signBtn.disabled = !c.signedOff && !c.dayFinished;
-        signBtn.title = signBtn.disabled ? `Waiting on ${c.personName} to mark their time card "Day finished" before this can be signed off.` : '';
-        signBtn.addEventListener('click', (e) => {
+      const right = document.createElement('div'); right.style.display = 'flex'; right.style.alignItems = 'center'; right.style.gap = '8px';
+      const signedCount = group.filter(c => c.signedOff).length;
+      const allSigned = signedCount === group.length;
+      const statusPill = document.createElement('span'); statusPill.className = 'pill ' + (allSigned ? 'ok' : 'stuck');
+      statusPill.textContent = allSigned ? 'Signed off' : `${signedCount}/${group.length} signed off`;
+      right.appendChild(statusPill);
+      if (!allSigned){
+        const quickSignBtn = document.createElement('button'); quickSignBtn.className = 'primary'; quickSignBtn.style.padding = '4px 10px'; quickSignBtn.style.fontSize = '11.5px';
+        quickSignBtn.textContent = 'Sign off all';
+        quickSignBtn.disabled = !first.dayFinished;
+        quickSignBtn.title = first.dayFinished
+          ? 'Sign off every not-yet-signed task in this job using the best available data, without opening it.'
+          : `Waiting on ${first.personName} to mark their time card "Day finished" before this can be signed off.`;
+        quickSignBtn.addEventListener('click', (e) => {
           e.stopPropagation();
-          signOffCard(date, c.buildId, c.taskId, Number(hoursInp.value) || 0, completeCb.checked);
+          group.filter(c => !c.signedOff).forEach(c => {
+            const hours = c.actualHours != null ? c.actualHours : c.planned;
+            signOffCard(date, c.buildId, c.taskId, hours, c.actualComplete);
+          });
           renderSignoffPage(); renderSignoffFab();
           if (document.getElementById('page-schedule').style.display !== 'none') renderResults();
         });
-        formRow.appendChild(signBtn);
+        right.appendChild(quickSignBtn);
+      }
+      const chevron = document.createElement('span'); chevron.className = 'drill-meta'; chevron.textContent = expanded ? '▾' : '▸';
+      right.appendChild(chevron);
+      main.appendChild(right);
+      main.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (expanded) signoffExpanded.delete(groupKey); else signoffExpanded.add(groupKey);
+        renderSignoffPage();
+      });
+      rowWrap.appendChild(main);
 
-        if (c.signedOff){
-          const undoBtn = document.createElement('button'); undoBtn.className = 'ghost'; undoBtn.style.padding = '4px 10px'; undoBtn.style.fontSize = '11.5px';
-          undoBtn.textContent = 'Undo sign off';
-          undoBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            undoSignOffCard(date, c.buildId, c.taskId);
-            renderSignoffPage(); renderSignoffFab();
-            if (document.getElementById('page-schedule').style.display !== 'none') renderResults();
-          });
-          formRow.appendChild(undoBtn);
-        }
-
-        const planTxt = document.createElement('div'); planTxt.className = 'drill-sub'; planTxt.style.width = '100%'; planTxt.style.marginTop = '2px';
-        planTxt.textContent = `Planned: ${c.planned}h${c.actualHours != null ? ' · Job Cards clock data: ' + c.actualHours + 'h' : ' · no Job Cards clock data yet'}`;
-        formRow.appendChild(planTxt);
-
-        detail.appendChild(formRow);
-        rowWrap.appendChild(detail);
+      if (expanded){
+        const groupDetail = document.createElement('div'); groupDetail.className = 'signoff-row-detail';
+        group.forEach(c => {
+          const taskHeading = document.createElement('div'); taskHeading.style.fontWeight = '600'; taskHeading.style.marginTop = '6px';
+          taskHeading.textContent = c.taskName;
+          groupDetail.appendChild(taskHeading);
+          groupDetail.appendChild(renderSignoffDetail(c));
+        });
+        rowWrap.appendChild(groupDetail);
       }
       list.appendChild(rowWrap);
     });
+
     listPanel.appendChild(list);
     container.appendChild(listPanel);
   }
