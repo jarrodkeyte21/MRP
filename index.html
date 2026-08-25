@@ -1201,6 +1201,7 @@
 
   function normalizeState(){
     if (!state.actuals) state.actuals = {};
+    if (!state.cardOrder) state.cardOrder = {};
     if (!state.dayFinished) state.dayFinished = {};
     if (!state.sickDays) state.sickDays = {};
     if (!state.financialReports) state.financialReports = [];
@@ -4023,6 +4024,26 @@
     save();
   }
 
+  // The employee's own drag-reordering of the job cards on one day's card — purely a display order, doesn't
+  // affect scheduling. Anything not yet in the stored order (a card added since it was last saved) falls in at
+  // the end in whatever order it was already going to render, via a stable sort.
+  function getCardOrder(personId, date){
+    return (state.cardOrder[personId] && state.cardOrder[personId][date]) || [];
+  }
+  function setCardOrder(personId, date, keys){
+    if (!state.cardOrder[personId]) state.cardOrder[personId] = {};
+    state.cardOrder[personId][date] = keys;
+    save();
+  }
+  function sortByCardOrder(items, personId, date){
+    const order = getCardOrder(personId, date);
+    const idx = new Map(order.map((k, i) => [k, i]));
+    return items
+      .map((item, i) => ({ item, i, rank: idx.has(item.key) ? idx.get(item.key) : Infinity }))
+      .sort((a, b) => (a.rank - b.rank) || (a.i - b.i))
+      .map(x => x.item);
+  }
+
   function sortedPeople(){
     return [...state.people].sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' }));
   }
@@ -5894,6 +5915,13 @@
       // Heading is three columns — job #, machine type, dealer/customer — rather than status/total-hours the
       // employee doesn't need. Task name (what the sub-tasks below belong to) sits on its own line underneath.
       const titleRow = document.createElement('div'); titleRow.className = 'taskcard-head';
+      // Drag handle for reordering multiple job cards on the same day — purely a display preference (see
+      // sortByCardOrder), separate from the whole panel being draggable so taps inside the card never
+      // accidentally start a drag.
+      const dragHandle = document.createElement('span'); dragHandle.className = 'drag-handle'; dragHandle.textContent = '⠿';
+      dragHandle.title = 'Drag to reorder this day\'s cards';
+      dragHandle.draggable = true;
+      titleRow.appendChild(dragHandle);
       const jobNumEl = document.createElement('div'); jobNumEl.className = 'taskcard-jobnum'; jobNumEl.textContent = c.jobNumber || '(no job #)';
       titleRow.appendChild(jobNumEl);
       const machineEl = document.createElement('div'); machineEl.className = 'taskcard-machine'; machineEl.textContent = c.machineType || '—';
@@ -5965,11 +5993,14 @@
           ]);
         });
       }
-      container.appendChild(cardPanel);
+      return { key: c.buildId + '|' + c.taskId, el: cardPanel, dragHandle };
     }
 
-    cards.forEach(c => renderTaskCard(c, false));
-    pulledTasks.forEach(c => renderTaskCard(c, true));
+    // Every job card on this day's list, in the person's own saved drag order (falling back to the natural
+    // schedule/manual-add order for anything not yet in it — see sortByCardOrder).
+    const jobPanels = [];
+    cards.forEach(c => jobPanels.push(renderTaskCard(c, false)));
+    pulledTasks.forEach(c => jobPanels.push(renderTaskCard(c, true)));
 
     // A sub-task picked via "Add work to this card" for a job/task already covered above just rode along on
     // that same card (see manualGroupKeysUsed). Whatever's left is grouped by job — one card per job, every
@@ -5991,6 +6022,10 @@
 
       const cardPanel = document.createElement('div'); cardPanel.className = 'panel'; cardPanel.style.marginTop = '10px';
       const titleRow = document.createElement('div'); titleRow.className = 'taskcard-head';
+      const dragHandle = document.createElement('span'); dragHandle.className = 'drag-handle'; dragHandle.textContent = '⠿';
+      dragHandle.title = 'Drag to reorder this day\'s cards';
+      dragHandle.draggable = true;
+      titleRow.appendChild(dragHandle);
       const jobNumEl = document.createElement('div'); jobNumEl.className = 'taskcard-jobnum'; jobNumEl.textContent = eff.jobNumber || '(no job #)';
       titleRow.appendChild(jobNumEl);
       const machineEl = document.createElement('div'); machineEl.className = 'taskcard-machine'; machineEl.textContent = eff.machineType || '—';
@@ -6016,7 +6051,34 @@
         })), person, date));
       });
 
-      container.appendChild(cardPanel);
+      jobPanels.push({ key: buildId + '|__manualjob__', el: cardPanel, dragHandle });
+    });
+
+    // Apply the person's saved order, then attach drag-to-reorder on each card's handle and append.
+    sortByCardOrder(jobPanels, person.id, date).forEach(({ key, el, dragHandle }) => {
+      dragHandle.addEventListener('dragstart', (e) => {
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', key);
+        el.style.opacity = '0.4';
+      });
+      dragHandle.addEventListener('dragend', () => { el.style.opacity = ''; });
+      el.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; });
+      el.addEventListener('drop', (e) => {
+        e.preventDefault();
+        const draggedKey = e.dataTransfer.getData('text/plain');
+        if (!draggedKey || draggedKey === key) return;
+        // Use whatever's currently on screen (post-sort) as the base order being edited, not raw jobPanels'
+        // push order, so a drop lands relative to what the person actually sees.
+        const displayedKeys = sortByCardOrder(jobPanels, person.id, date).map(p => p.key);
+        const from = displayedKeys.indexOf(draggedKey);
+        const to = displayedKeys.indexOf(key);
+        if (from === -1 || to === -1) return;
+        displayedKeys.splice(from, 1);
+        displayedKeys.splice(to, 0, draggedKey);
+        setCardOrder(person.id, date, displayedKeys);
+        renderJobCardsLivePage();
+      });
+      container.appendChild(el);
     });
 
     // Supervision and Factory Maintenance / Lost Time entries each get their own Start/Stop control (top of
