@@ -651,12 +651,17 @@
         task = { id: uid('jt'), taskRefId: item.taskId, name: setupTask ? setupTask.name : 'Task', dependsOn: [], maxPeople: null, subtasks: [] };
         jr.tasks.push(task);
       }
-      const nextNum = String((task.subtasks.length + 1) * 10);
+      // The option's own Task # comes along and merges the new sub-task into the task's existing order (a
+      // tie just sits next to whichever sub-task already has that number — resortSubtasksByNumber's sort is
+      // stable) rather than always tacking it on at the end regardless of where it numerically belongs.
+      const number = (item.number !== undefined && item.number !== null && item.number !== '')
+        ? item.number : String((task.subtasks.length + 1) * 10);
       task.subtasks.push({
-        id: uid('jst'), number: nextNum, name: item.subtaskName || option.name, notes: '', standardTime: Number(item.hours) || 0, selected: true,
+        id: uid('jst'), number, name: item.subtaskName || option.name, notes: '', standardTime: Number(item.hours) || 0, selected: true,
         completed: false, timeLogs: [], timerRunning: false,
         fromOptionId: option.id, fromOptionName: option.name
       });
+      resortSubtasksByNumber(task);
     });
   }
 
@@ -3898,9 +3903,10 @@
     }).filter(Boolean);
   }
 
-  // How far ahead a person's assign view plans in one screen — lets a supervisor allocate the whole
-  // upcoming month of scheduled work in one pass instead of clicking through it a day at a time.
-  const ASSIGN_WINDOW_DAYS = 28;
+  // How far ahead a person's assign view plans in one screen. Kept short on purpose — the schedule that far
+  // out shifts constantly, so a long window was mostly stale. Anything further out (or off the schedule
+  // entirely) goes through the "Manually assign other work" picker under each day instead.
+  const ASSIGN_WINDOW_DAYS = 7;
 
   function dateRangeFrom(startDate, numDays){
     const dates = [];
@@ -4920,11 +4926,11 @@
     // task the engine put on a different day never appears here even if it's otherwise ready. This picker is
     // the deliberate escape hatch: any job/task/sub-task at all, manually placed on this exact day, the same
     // way the floor's own "Add work to this card" form works (a chosen sub-task's hours go straight onto its
-    // real timeLogs). Collapsed by default — one of these sits under every day in a (up to 28-day) list.
+    // real timeLogs). Collapsed by default — one sits under every day in the list.
     const manualKey = person.id + '|' + date;
     const manualToggle = document.createElement('button'); manualToggle.className = 'ghost icon'; manualToggle.style.marginTop = '10px';
     const manualIsOpen = assignManualExpanded.has(manualKey);
-    manualToggle.textContent = (manualIsOpen ? '▾' : '▸') + ' Manually assign other work…';
+    manualToggle.textContent = (manualIsOpen ? '▾' : '▸') + ' Add task manually…';
     manualToggle.addEventListener('click', () => {
       if (manualIsOpen) assignManualExpanded.delete(manualKey); else assignManualExpanded.add(manualKey);
       renderJobCardsPage();
@@ -5083,6 +5089,14 @@
     addBtn.addEventListener('click', () => {
       if (!descInp.value.trim() && !jobSel.value){ alert('Enter a description or pick a job first.'); return; }
       const date = dateInp.value || jobCardsView.date;
+      // A task added here bypasses the scheduler entirely, so its normal dependency ordering was never
+      // checked — warn (naming what it depends on) rather than silently letting it start out of sequence, but
+      // still let the manager go ahead since sometimes that's deliberate (e.g. genuinely working ahead).
+      if (jobSel.value && taskSel.value){
+        const raw = state.builds.find(b => b.id === jobSel.value);
+        const depNames = raw ? taskDependencyNames(raw, taskSel.value) : [];
+        if (depNames.length && !confirm(`This task depends on ${depNames.join(', ')} — make sure ${depNames.length === 1 ? 'it is' : 'they are'} actually finished first. Add it anyway?`)) return;
+      }
       if (subtaskSel.value){
         // A specific sub-task is known — credit the hours straight onto its own timeLogs (real production
         // work) instead of a generic ad-hoc entry, so it counts toward that job's progress/reports exactly
@@ -7301,17 +7315,10 @@
 
               if (groupExpanded){
                 const table = document.createElement('table'); table.className = 'editor';
-                table.innerHTML = '<thead><tr><th style="width:60px">Task #</th><th>Task</th><th>Sub-task name</th><th style="width:80px">Hours</th><th></th></tr></thead>';
+                table.innerHTML = '<thead><tr><th>Task</th><th style="width:60px">Task #</th><th>Sub-task name</th><th style="width:80px">Hours</th><th></th></tr></thead>';
                 const tbody = document.createElement('tbody');
                 items.forEach(item => {
                   const tr = document.createElement('tr');
-                  const tdNum = document.createElement('td');
-                  const numI = document.createElement('input'); numI.type = 'text'; numI.value = item.number || ''; numI.style.width = '48px';
-                  numI.title = 'Sets where this sits among this task\'s other sub-tasks in the option.';
-                  numI.addEventListener('click', (e) => e.stopPropagation());
-                  numI.addEventListener('input', () => { item.number = numI.value; resortOptionItemsByNumber(opt, item.taskId); save(); });
-                  tdNum.appendChild(numI); tr.appendChild(tdNum);
-
                   const tdTask = document.createElement('td');
                   const taskSel = document.createElement('select');
                   const noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '— Pick a task —';
@@ -7327,6 +7334,13 @@
                     save(); renderJobsPage();
                   });
                   tdTask.appendChild(taskSel); tr.appendChild(tdTask);
+
+                  const tdNum = document.createElement('td');
+                  const numI = document.createElement('input'); numI.type = 'text'; numI.value = item.number || ''; numI.style.width = '48px';
+                  numI.title = 'Sets where this sub-task lands among the job\'s other sub-tasks once the option is applied.';
+                  numI.addEventListener('click', (e) => e.stopPropagation());
+                  numI.addEventListener('input', () => { item.number = numI.value; resortOptionItemsByNumber(opt, item.taskId); save(); });
+                  tdNum.appendChild(numI); tr.appendChild(tdNum);
 
                   const tdName = document.createElement('td');
                   const nameI = document.createElement('input'); nameI.type = 'text'; nameI.value = item.subtaskName || '';
