@@ -1051,7 +1051,6 @@
     if (!session){ showAuthGate(); return; }
     await onSignedIn(session);
   }
-
   document.getElementById('btnSignIn').addEventListener('click', async () => {
     if (!sb) return;
     const email = document.getElementById('authEmail').value.trim();
@@ -1186,6 +1185,7 @@
   function normalizeState(){
     if (!state.actuals) state.actuals = {};
     if (!state.dayFinished) state.dayFinished = {};
+    if (!state.sickDays) state.sickDays = {};
     if (!state.financialReports) state.financialReports = [];
     state.financialReports.forEach(r => {
       if (!r.costOfGoodsByTask) r.costOfGoodsByTask = {};
@@ -1197,6 +1197,16 @@
     state.optionTemplates.forEach(o => {
       if (!Array.isArray(o.items)) o.items = [];
       if (!Array.isArray(o.applicableMachineTypes)) o.applicableMachineTypes = [];
+      // Pre-existing items (created before Task # was added) keep their current relative order within their
+      // task by numbering sequentially in whatever order they already appear.
+      const seenPerTask = {};
+      o.items.forEach(item => {
+        if (item.number === undefined || item.number === null){
+          const key = item.taskId || '';
+          seenPerTask[key] = (seenPerTask[key] || 0) + 1;
+          item.number = String(seenPerTask[key] * 10);
+        }
+      });
     });
     if (state.meta.lastCheckedDate === undefined) state.meta.lastCheckedDate = null;
     // Sign-off is just a correction layered on top of the simulation now (see runSchedule), not a gate on the
@@ -1501,6 +1511,8 @@
   let optionsExpanded = new Set();
   let optionsAppliedExpanded = new Set();
   let optionsAppliedTaskExpanded = new Set(); // keyed `${optionId}|${taskId}`
+  let optionTemplateTaskExpanded = new Set(); // keyed `${optionId}|${taskId}` — library editor's task groups
+  let sickDayDraft = null; // { personId, choices: { '${buildId}|${taskId}': newPersonId } } while marking someone sick
   let customOptionDraft = null; // { name, items: [{id, taskId, subtaskName, hours}] } while building a one-off option for a job
 
   // ---------- date helpers ----------
@@ -3281,6 +3293,23 @@
       return String(a.number || '').localeCompare(String(b.number || ''));
     });
   }
+  // Same numeric-aware ordering as resortSubtasksByNumber, but for one option template's items — only the
+  // items belonging to `taskId` are reordered among themselves (their positions within opt.items), so sorting
+  // one task's group never disturbs another task's group order.
+  function resortOptionItemsByNumber(opt, taskId){
+    const positions = [];
+    opt.items.forEach((item, i) => { if (item.taskId === taskId) positions.push(i); });
+    const sorted = positions.map(i => opt.items[i]).sort((a, b) => {
+      const na = parseFloat(a.number), nb = parseFloat(b.number);
+      const aIsNum = a.number !== '' && a.number !== null && a.number !== undefined && !isNaN(na);
+      const bIsNum = b.number !== '' && b.number !== null && b.number !== undefined && !isNaN(nb);
+      if (aIsNum && bIsNum) return na - nb;
+      if (aIsNum) return -1;
+      if (bIsNum) return 1;
+      return String(a.number || '').localeCompare(String(b.number || ''));
+    });
+    positions.forEach((i, k) => { opt.items[i] = sorted[k]; });
+  }
   function jobEntityTotalHours(entity){
     return (entity.tasks || []).reduce((sum, t) => sum + jobTaskSelectedHours(t), 0);
   }
@@ -3470,16 +3499,16 @@
     reader.readAsText(file);
   }
 
-  const OPTION_CSV_HEADER = ['Task name', 'Sub-task name', 'Hours'];
+  const OPTION_CSV_HEADER = ['Task name', 'Task #', 'Sub-task name', 'Hours'];
 
   function exportOptionCsv(opt){
     const rows = [OPTION_CSV_HEADER];
     if (opt.items.length === 0){
-      rows.push(['', '', '']);
+      rows.push(['', '', '', '']);
     } else {
       opt.items.forEach(item => {
         const task = state.tasks.find(t => t.id === item.taskId);
-        rows.push([task ? task.name : '', item.subtaskName || '', item.hours || 0]);
+        rows.push([task ? task.name : '', item.number || '', item.subtaskName || '', item.hours || 0]);
       });
     }
     const csv = rows.map(r => r.map(csvField).join(',')).join('\n');
@@ -3507,12 +3536,13 @@
       let unmatchedTasks = 0;
       dataRows.forEach(r => {
         if (!r || r.every(c => (c || '').trim() === '')) return;
-        const [taskName, subtaskName, hoursStr] = r;
+        const [taskName, numberStr, subtaskName, hoursStr] = r;
         const trimmedTaskName = (taskName || '').trim();
         const task = state.tasks.find(t => t.name.trim().toLowerCase() === trimmedTaskName.toLowerCase());
         if (trimmedTaskName && !task) unmatchedTasks++;
         newItems.push({
           id: uid('opti'), taskId: task ? task.id : null,
+          number: (numberStr || '').trim(),
           subtaskName: (subtaskName || '').trim(),
           hours: Number(hoursStr) || 0
         });
@@ -3542,6 +3572,11 @@
   // taskAssignments: {taskId: {personId, excludedSubtasks}} — excludedSubtasks lets a supervisor drop specific
   // sub-tasks off that person's card without touching the Jobs tab's own selected/hours data. ----------
   let jobCardsView = { level: 'list', date: getTodayISO(), assignPersonId: null, cardBuildId: null, cardTaskId: null, cardDate: null };
+
+  // Which per-day "manually assign other work" pickers are expanded in the Assign view — keyed
+  // `${personId}|${date}`, collapsed by default since it's a full job/task/sub-task form and there's one of
+  // these under every day in the (up to 28-day) list.
+  let assignManualExpanded = new Set();
 
   // A tab left open across midnight would otherwise keep showing yesterday's date forever, since
   // jobCardsView.date is only ever set explicitly (by the date picker or this catch-up). Only nudges it forward
@@ -4046,6 +4081,32 @@
     return c.assignedPersonId === personId || (c.secondaryPersonIds || []).includes(personId);
   }
 
+  // ---------- Sick / away day: pull every one of a person's scheduled cards for a date off them in one go
+  // (via reassignCardToPerson's per-date override, same mechanism as the single-card "Reassign to" dropdown),
+  // optionally handing each one to a replacement, and flags the day so it's visible elsewhere. A card left
+  // without a replacement just goes unassigned for that day rather than silently staying on the sick person. ----------
+  function isPersonSickOn(personId, date){
+    return !!(state.sickDays[date] && state.sickDays[date][personId]);
+  }
+
+  function markPersonSick(personId, date, reassignments){
+    // reassignments: Map or plain object of `${buildId}|${taskId}` -> newPersonId (or '' / null to unassign)
+    Object.entries(reassignments || {}).forEach(([key, newPersonId]) => {
+      const [buildId, taskId] = key.split('|');
+      reassignCardToPerson({ buildId, taskId, date }, newPersonId || null);
+    });
+    if (!state.sickDays[date]) state.sickDays[date] = {};
+    state.sickDays[date][personId] = true;
+    save();
+  }
+
+  function unmarkPersonSick(personId, date){
+    if (!state.sickDays[date]) return;
+    delete state.sickDays[date][personId];
+    if (Object.keys(state.sickDays[date]).length === 0) delete state.sickDays[date];
+    save();
+  }
+
   // The job-record task (with live sub-tasks) that backs a job card, if the build is job-linked.
   function jobCardSourceTask(raw, taskId){
     const eff = effectiveBuildData(raw);
@@ -4380,11 +4441,134 @@
     container.appendChild(row);
   }
 
+  // Pick someone, see every card they're on for the selected date, choose who (if anyone) picks up each one,
+  // then confirm — every card shown comes off the sick person either way (reassigned, or left unassigned if
+  // no one's picked). Reuses reassignCardToPerson so this is exactly the same per-date override the single-
+  // card "Reassign to" dropdown already uses, just applied in one batch with a review step first.
+  function renderSickDayPanel(container){
+    const date = jobCardsView.date;
+    const panel = document.createElement('div'); panel.className = 'panel'; panel.style.marginTop = '16px';
+    panel.innerHTML = `<h2>Employee away / sick</h2><div class="hint">Mark someone off for ${fmtDateLong(date)} and choose who picks up their scheduled work — review the list before confirming.</div>`;
+
+    if (sickDayDraft && !state.people.some(p => p.id === sickDayDraft.personId)) sickDayDraft = null;
+
+    const alreadySick = Object.keys(state.sickDays[date] || {}).filter(id => state.people.some(p => p.id === id));
+    if (alreadySick.length){
+      const sickList = document.createElement('div'); sickList.style.marginTop = '10px';
+      alreadySick.forEach(id => {
+        const p = state.people.find(x => x.id === id);
+        const row = document.createElement('div'); row.style.display = 'flex'; row.style.alignItems = 'center'; row.style.gap = '10px'; row.style.marginBottom = '4px';
+        const label = document.createElement('span'); label.textContent = `${p ? p.name : '(unknown)'} — marked sick for ${fmtDateLong(date)}`;
+        row.appendChild(label);
+        const undoBtn = document.createElement('button'); undoBtn.className = 'ghost icon';
+        undoBtn.textContent = 'Undo';
+        undoBtn.title = 'Clears the sick flag for this date — doesn\'t undo any cards already reassigned.';
+        undoBtn.addEventListener('click', () => { unmarkPersonSick(id, date); renderJobCardsPage(); });
+        row.appendChild(undoBtn);
+        sickList.appendChild(row);
+      });
+      panel.appendChild(sickList);
+    }
+
+    const pickRow = document.createElement('div'); pickRow.className = 'field-row'; pickRow.style.marginTop = '10px';
+    const pickLabel = document.createElement('label'); pickLabel.textContent = 'Person';
+    pickRow.appendChild(pickLabel);
+    const pickSel = document.createElement('select');
+    const noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '— Pick a person —';
+    pickSel.appendChild(noneOpt);
+    sortedPeople().forEach(p => {
+      const opt = document.createElement('option'); opt.value = p.id;
+      opt.textContent = (p.name || '(unnamed)') + (isPersonSickOn(p.id, date) ? ' (already marked sick)' : '');
+      opt.disabled = isPersonSickOn(p.id, date);
+      if (sickDayDraft && sickDayDraft.personId === p.id) opt.selected = true;
+      pickSel.appendChild(opt);
+    });
+    pickSel.addEventListener('change', () => {
+      sickDayDraft = pickSel.value ? { personId: pickSel.value, choices: {} } : null;
+      renderJobCardsPage();
+    });
+    pickRow.appendChild(pickSel);
+    panel.appendChild(pickRow);
+
+    if (sickDayDraft){
+      const person = state.people.find(p => p.id === sickDayDraft.personId);
+      const theirCards = buildJobCardsForDate(date).filter(c => isCardForPerson(c, sickDayDraft.personId));
+
+      if (theirCards.length === 0){
+        const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
+        empty.textContent = `${person ? person.name : 'This person'} has nothing scheduled on ${fmtDateLong(date)} — you can still mark them sick.`;
+        panel.appendChild(empty);
+      } else {
+        const list = document.createElement('div'); list.className = 'drill-list'; list.style.marginTop = '10px';
+        theirCards.forEach(c => {
+          const key = c.buildId + '|' + c.taskId;
+          const competent = sortedPeople().filter(p =>
+            p.id !== sickDayDraft.personId && !isPersonSickOn(p.id, date) && (p.competencies || []).includes(c.taskId)
+          );
+          const row = document.createElement('div'); row.className = 'drill-row'; row.style.cursor = 'default'; row.style.flexWrap = 'wrap';
+          const main = document.createElement('div'); main.className = 'drill-main';
+          main.textContent = `${jobIdentityLabel(c.jobNumber, c.dealer, c.customer)} — ${c.taskName}`;
+          const sub = document.createElement('div'); sub.className = 'drill-sub'; sub.textContent = `${c.hours}h`;
+          main.appendChild(sub);
+          row.appendChild(main);
+          const sel = document.createElement('select');
+          const unassignedOpt = document.createElement('option'); unassignedOpt.value = ''; unassignedOpt.textContent = '— Leave unassigned —';
+          sel.appendChild(unassignedOpt);
+          competent.forEach(p => {
+            const opt = document.createElement('option'); opt.value = p.id; opt.textContent = p.name || '(unnamed)';
+            if (sickDayDraft.choices[key] === p.id) opt.selected = true;
+            sel.appendChild(opt);
+          });
+          if (!competent.length){
+            const noneNote = document.createElement('span'); noneNote.className = 'hint'; noneNote.style.marginLeft = '8px';
+            noneNote.textContent = 'No one else is set up as competent for this task.';
+            row.appendChild(noneNote);
+          }
+          sel.addEventListener('change', () => { sickDayDraft.choices[key] = sel.value || ''; });
+          row.appendChild(sel);
+          list.appendChild(row);
+        });
+        panel.appendChild(list);
+      }
+
+      const reassignedCount = Object.values(sickDayDraft.choices).filter(Boolean).length;
+      const summary = document.createElement('div'); summary.className = 'hint'; summary.style.marginTop = '10px';
+      summary.textContent = theirCards.length
+        ? `${reassignedCount} of ${theirCards.length} card${theirCards.length === 1 ? '' : 's'} will be reassigned; ${theirCards.length - reassignedCount} will become unassigned.`
+        : '';
+      if (summary.textContent) panel.appendChild(summary);
+
+      const actionRow = document.createElement('div'); actionRow.style.marginTop = '10px'; actionRow.style.display = 'flex'; actionRow.style.gap = '8px';
+      const confirmBtn = document.createElement('button'); confirmBtn.className = 'primary';
+      confirmBtn.textContent = `Mark ${person ? person.name : 'this person'} sick & reassign`;
+      confirmBtn.addEventListener('click', () => {
+        if (!confirm(`Mark ${person ? person.name : 'this person'} sick for ${fmtDateLong(date)}? ${theirCards.length} card${theirCards.length === 1 ? '' : 's'} will come off them — ${reassignedCount} reassigned, ${theirCards.length - reassignedCount} left unassigned.`)) return;
+        // Every card shown gets processed, not just ones the manager actually touched a dropdown for — a card
+        // left on its default "— Leave unassigned —" still needs reassignCardToPerson called with null, or it
+        // would silently stay on the sick person.
+        const reassignments = {};
+        theirCards.forEach(c => { reassignments[c.buildId + '|' + c.taskId] = sickDayDraft.choices[c.buildId + '|' + c.taskId] || null; });
+        markPersonSick(sickDayDraft.personId, date, reassignments);
+        sickDayDraft = null;
+        renderJobCardsPage();
+      });
+      actionRow.appendChild(confirmBtn);
+      const cancelBtn = document.createElement('button'); cancelBtn.className = 'ghost'; cancelBtn.textContent = 'Cancel';
+      cancelBtn.addEventListener('click', () => { sickDayDraft = null; renderJobCardsPage(); });
+      actionRow.appendChild(cancelBtn);
+      panel.appendChild(actionRow);
+    }
+
+    container.appendChild(panel);
+  }
+
   function renderJobCardsList(container){
     const dateWrap = document.createElement('div'); dateWrap.className = 'panel';
     dateWrap.innerHTML = '<h2>Date</h2><div class="hint">Job cards below are for this date — pick a day to see and assign that day\'s work. Cards older than 2 days move to the Archive tab.</div>';
     renderJobCardsDatePicker(dateWrap, renderJobCardsPage);
     container.appendChild(dateWrap);
+
+    renderSickDayPanel(container);
 
     renderEmployeesList(container);
 
@@ -4447,7 +4631,7 @@
       sortedPeople().forEach(p => {
         const row = document.createElement('div'); row.className = 'drill-row';
         const main = document.createElement('div'); main.className = 'drill-main';
-        main.textContent = p.name || '(unnamed)';
+        main.textContent = (p.name || '(unnamed)') + (isPersonSickOn(p.id, jobCardsView.date) ? ' — sick' : '');
         row.appendChild(main);
         const meta = document.createElement('div'); meta.className = 'drill-meta';
         const assignedCards = cards.filter(c => c.assignedPersonId === p.id);
@@ -4731,6 +4915,26 @@
       row.appendChild(rightWrap);
       groupWrap.appendChild(row);
     });
+
+    // This day's card list above only ever shows work the schedule engine actually allocated to `date` — a
+    // task the engine put on a different day never appears here even if it's otherwise ready. This picker is
+    // the deliberate escape hatch: any job/task/sub-task at all, manually placed on this exact day, the same
+    // way the floor's own "Add work to this card" form works (a chosen sub-task's hours go straight onto its
+    // real timeLogs). Collapsed by default — one of these sits under every day in a (up to 28-day) list.
+    const manualKey = person.id + '|' + date;
+    const manualToggle = document.createElement('button'); manualToggle.className = 'ghost icon'; manualToggle.style.marginTop = '10px';
+    const manualIsOpen = assignManualExpanded.has(manualKey);
+    manualToggle.textContent = (manualIsOpen ? '▾' : '▸') + ' Manually assign other work…';
+    manualToggle.addEventListener('click', () => {
+      if (manualIsOpen) assignManualExpanded.delete(manualKey); else assignManualExpanded.add(manualKey);
+      renderJobCardsPage();
+    });
+    groupWrap.appendChild(manualToggle);
+    if (manualIsOpen){
+      const manualPanel = document.createElement('div'); manualPanel.style.marginTop = '4px'; manualPanel.style.paddingLeft = '10px';
+      renderAdHocForm(manualPanel, person, { date }, renderJobCardsPage);
+      groupWrap.appendChild(manualPanel);
+    }
 
     return true;
   }
@@ -5119,6 +5323,18 @@
     return h * 60 + m;
   }
 
+  // How long a still-running session has been going, as "1h 23m" / "8m" — recomputed fresh on every render, so
+  // it ticks forward on its own via the existing 5-second auto-refresh with no extra timer/interval to leak.
+  // If "now" reads earlier than the start (crossed midnight since clocking on), treats it as 0 rather than
+  // showing a negative/nonsense duration.
+  function elapsedLabel(startTimeHHMM){
+    const startMin = timeToMinutes(startTimeHHMM);
+    const nowMin = timeToMinutes(nowTimeHHMM());
+    const diff = Math.max(0, nowMin - startMin);
+    const h = Math.floor(diff / 60), m = diff % 60;
+    return h > 0 ? `${h}h ${m}m` : `${m}m`;
+  }
+
   // `obj` is optional (existing callers that don't pass it just get the plain duration, unsplit) — when given
   // and its task is shared-clock, any minute that overlaps another shared-clock session for the SAME person is
   // credited at half value instead of double-counting two jobs run together in one blast/paint session. A
@@ -5208,6 +5424,18 @@
       timerBtn.textContent = obj.timerRunning ? '⏹ Stop' : '▶ Start';
       timerBtn.addEventListener('click', () => { toggleSubtaskTimer(obj, person.id, date, taskIdForTimerObj(obj)); renderJobCardsLivePage(); });
       actions.appendChild(timerBtn);
+
+      // Lets the employee see how long they've been clocked on without having to stop it to find out — just
+      // reads the open session's start time, so it ticks forward for free on the existing 5-second refresh
+      // instead of needing its own timer to manage/clean up.
+      if (obj.timerRunning){
+        const openLog = [...obj.timeLogs].reverse().find(tl => !tl.stopTime);
+        if (openLog && openLog.startTime){
+          const runningBadge = document.createElement('span'); runningBadge.style.fontSize = '13px'; runningBadge.style.color = 'var(--ink-muted)'; runningBadge.style.fontWeight = '600';
+          runningBadge.textContent = `⏱ ${elapsedLabel(openLog.startTime)}`;
+          actions.appendChild(runningBadge);
+        }
+      }
 
       // Sessions sits on its own in the middle — deliberately not next to Start/Stop, so reaching for it can't
       // accidentally hit (or be hit by) the Start/Stop tap.
@@ -5395,7 +5623,7 @@
       const supTimeInfo = document.createElement('span'); supTimeInfo.className = 'hint';
       if (runningEntry){
         const openLog = [...runningEntry.timeLogs].reverse().find(tl => !tl.stopTime);
-        supTimeInfo.textContent = openLog ? `Started ${openLog.startTime}` : '';
+        supTimeInfo.textContent = openLog ? `Started ${openLog.startTime} — ⏱ ${elapsedLabel(openLog.startTime)}` : '';
       }
       supRow.appendChild(supTimeInfo);
 
@@ -5429,7 +5657,7 @@
       const fmTimeInfo = document.createElement('span'); fmTimeInfo.className = 'hint';
       if (fmRunningEntry){
         const openLog = [...fmRunningEntry.timeLogs].reverse().find(tl => !tl.stopTime);
-        fmTimeInfo.textContent = openLog ? `Started ${openLog.startTime}` : '';
+        fmTimeInfo.textContent = openLog ? `Started ${openLog.startTime} — ⏱ ${elapsedLabel(openLog.startTime)}` : '';
       }
       fmRow.appendChild(fmTimeInfo);
 
@@ -7033,61 +7261,132 @@
           const panel = document.createElement('div'); panel.className = 'subtask-panel';
           if (opt.items.length === 0){
             const empty = document.createElement('div'); empty.className = 'dep-empty';
-            empty.textContent = 'No items yet — add one below.';
+            empty.textContent = 'No tasks yet — add one below.';
             panel.appendChild(empty);
           } else {
-            const table = document.createElement('table'); table.className = 'editor';
-            table.innerHTML = '<thead><tr><th>Task</th><th>Sub-task name</th><th style="width:80px">Hours</th><th></th></tr></thead>';
-            const tbody = document.createElement('tbody');
+            // Grouped and collapsed by task (same as the per-job Options panel) rather than one flat list —
+            // an option can touch more than one task, and this makes it obvious how many sub-tasks/hours land
+            // on each. Group order follows the shop's own task sequence (state.tasks) so it's predictable;
+            // within a group, the Task # field is a real sort key exactly like a job's own sub-tasks.
+            const byTaskId = new Map();
             opt.items.forEach(item => {
-              const tr = document.createElement('tr');
-              const tdTask = document.createElement('td');
-              const taskSel = document.createElement('select');
-              const noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '— Pick a task —';
-              taskSel.appendChild(noneOpt);
-              state.tasks.forEach(t => {
-                const o = document.createElement('option'); o.value = t.id; o.textContent = t.name;
-                if (item.taskId === t.id) o.selected = true;
-                taskSel.appendChild(o);
-              });
-              taskSel.addEventListener('click', (e) => e.stopPropagation());
-              taskSel.addEventListener('change', () => { item.taskId = taskSel.value || null; save(); });
-              tdTask.appendChild(taskSel); tr.appendChild(tdTask);
-
-              const tdName = document.createElement('td');
-              const nameI = document.createElement('input'); nameI.type = 'text'; nameI.value = item.subtaskName || '';
-              nameI.placeholder = 'e.g. Install GPS antenna';
-              nameI.addEventListener('click', (e) => e.stopPropagation());
-              nameI.addEventListener('input', () => { item.subtaskName = nameI.value; save(); });
-              tdName.appendChild(nameI); tr.appendChild(tdName);
-
-              const tdHours = document.createElement('td');
-              const hoursI = makeHourInput(item.hours, (val) => { item.hours = Number(val) || 0; save(); refreshMeta(); });
-              hoursI.addEventListener('click', (e) => e.stopPropagation());
-              tdHours.appendChild(hoursI); tr.appendChild(tdHours);
-
-              const tdDel = document.createElement('td');
-              const itemDelBtn = document.createElement('button'); itemDelBtn.className = 'icon ghost'; itemDelBtn.textContent = '✕';
-              itemDelBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                opt.items = opt.items.filter(x => x.id !== item.id);
-                save(); renderJobsPage();
-              });
-              tdDel.appendChild(itemDelBtn); tr.appendChild(tdDel);
-
-              tbody.appendChild(tr);
+              const key = item.taskId || '';
+              if (!byTaskId.has(key)) byTaskId.set(key, []);
+              byTaskId.get(key).push(item);
             });
-            table.appendChild(tbody);
-            panel.appendChild(table);
+            const groupKeys = Array.from(byTaskId.keys()).sort((a, b) => {
+              if (a === '') return 1; if (b === '') return -1;
+              return state.tasks.findIndex(t => t.id === a) - state.tasks.findIndex(t => t.id === b);
+            });
+            groupKeys.forEach(taskKey => {
+              const items = byTaskId.get(taskKey);
+              const task = state.tasks.find(t => t.id === taskKey);
+              const groupKey = opt.id + '|' + (taskKey || '(none)');
+              const groupExpanded = optionTemplateTaskExpanded.has(groupKey);
+              const taskRow = document.createElement('div'); taskRow.className = 'drill-row';
+              taskRow.style.background = 'var(--bg)';
+              const taskMain = document.createElement('div'); taskMain.className = 'drill-main';
+              taskMain.textContent = task ? task.name : '(no task picked)';
+              taskRow.appendChild(taskMain);
+              const taskMeta = document.createElement('div'); taskMeta.className = 'drill-meta';
+              const groupHours = items.reduce((s, i) => s + (Number(i.hours) || 0), 0);
+              taskMeta.textContent = `${items.length} sub-task${items.length === 1 ? '' : 's'} — ${groupHours}h ${groupExpanded ? '▾' : '▸'}`;
+              taskRow.appendChild(taskMeta);
+              taskRow.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (groupExpanded) optionTemplateTaskExpanded.delete(groupKey); else optionTemplateTaskExpanded.add(groupKey);
+                renderJobsPage();
+              });
+              panel.appendChild(taskRow);
+
+              if (groupExpanded){
+                const table = document.createElement('table'); table.className = 'editor';
+                table.innerHTML = '<thead><tr><th style="width:60px">Task #</th><th>Task</th><th>Sub-task name</th><th style="width:80px">Hours</th><th></th></tr></thead>';
+                const tbody = document.createElement('tbody');
+                items.forEach(item => {
+                  const tr = document.createElement('tr');
+                  const tdNum = document.createElement('td');
+                  const numI = document.createElement('input'); numI.type = 'text'; numI.value = item.number || ''; numI.style.width = '48px';
+                  numI.title = 'Sets where this sits among this task\'s other sub-tasks in the option.';
+                  numI.addEventListener('click', (e) => e.stopPropagation());
+                  numI.addEventListener('input', () => { item.number = numI.value; resortOptionItemsByNumber(opt, item.taskId); save(); });
+                  tdNum.appendChild(numI); tr.appendChild(tdNum);
+
+                  const tdTask = document.createElement('td');
+                  const taskSel = document.createElement('select');
+                  const noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '— Pick a task —';
+                  taskSel.appendChild(noneOpt);
+                  state.tasks.forEach(t => {
+                    const o = document.createElement('option'); o.value = t.id; o.textContent = t.name;
+                    if (item.taskId === t.id) o.selected = true;
+                    taskSel.appendChild(o);
+                  });
+                  taskSel.addEventListener('click', (e) => e.stopPropagation());
+                  taskSel.addEventListener('change', () => {
+                    item.taskId = taskSel.value || null;
+                    save(); renderJobsPage();
+                  });
+                  tdTask.appendChild(taskSel); tr.appendChild(tdTask);
+
+                  const tdName = document.createElement('td');
+                  const nameI = document.createElement('input'); nameI.type = 'text'; nameI.value = item.subtaskName || '';
+                  nameI.placeholder = 'e.g. Install GPS antenna';
+                  nameI.addEventListener('click', (e) => e.stopPropagation());
+                  nameI.addEventListener('input', () => { item.subtaskName = nameI.value; save(); });
+                  tdName.appendChild(nameI); tr.appendChild(tdName);
+
+                  const tdHours = document.createElement('td');
+                  const hoursI = makeHourInput(item.hours, (val) => { item.hours = Number(val) || 0; save(); refreshMeta(); });
+                  hoursI.addEventListener('click', (e) => e.stopPropagation());
+                  tdHours.appendChild(hoursI); tr.appendChild(tdHours);
+
+                  const tdDel = document.createElement('td');
+                  const itemDelBtn = document.createElement('button'); itemDelBtn.className = 'icon ghost'; itemDelBtn.textContent = '✕';
+                  itemDelBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    opt.items = opt.items.filter(x => x.id !== item.id);
+                    save(); renderJobsPage();
+                  });
+                  tdDel.appendChild(itemDelBtn); tr.appendChild(tdDel);
+
+                  tbody.appendChild(tr);
+                });
+                table.appendChild(tbody);
+                panel.appendChild(table);
+
+                const addSubBtn = document.createElement('button'); addSubBtn.className = 'ghost icon'; addSubBtn.style.marginTop = '8px'; addSubBtn.style.marginBottom = '10px';
+                addSubBtn.textContent = '+ Add sub-task';
+                addSubBtn.addEventListener('click', (e) => {
+                  e.stopPropagation();
+                  const nextNum = String((items.length + 1) * 10);
+                  opt.items.push({ id: uid('opti'), taskId: taskKey || null, subtaskName: '', hours: 0, number: nextNum });
+                  save(); renderJobsPage();
+                });
+                panel.appendChild(addSubBtn);
+              }
+            });
           }
-          const addItemBtn = document.createElement('button'); addItemBtn.className = 'ghost icon'; addItemBtn.style.marginTop = '10px';
-          addItemBtn.textContent = '+ Add item';
-          addItemBtn.addEventListener('click', (e) => {
+          const addTaskRow = document.createElement('div'); addTaskRow.className = 'field-row'; addTaskRow.style.marginTop = '10px';
+          const addTaskSel = document.createElement('select'); addTaskSel.addEventListener('click', (e) => e.stopPropagation());
+          const addTaskNone = document.createElement('option'); addTaskNone.value = ''; addTaskNone.textContent = '— Pick a task —';
+          addTaskSel.appendChild(addTaskNone);
+          state.tasks.forEach(t => {
+            const o = document.createElement('option'); o.value = t.id; o.textContent = t.name;
+            addTaskSel.appendChild(o);
+          });
+          addTaskRow.appendChild(addTaskSel);
+          const addTaskBtn = document.createElement('button'); addTaskBtn.className = 'ghost icon';
+          addTaskBtn.textContent = '+ Add task';
+          addTaskBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            opt.items.push({ id: uid('opti'), taskId: null, subtaskName: '', hours: 0 });
+            if (!addTaskSel.value){ alert('Pick a task first.'); return; }
+            opt.items.push({ id: uid('opti'), taskId: addTaskSel.value, subtaskName: '', hours: 0, number: '10' });
+            optionTemplateTaskExpanded.add(opt.id + '|' + addTaskSel.value);
             save(); renderJobsPage();
           });
-          panel.appendChild(addItemBtn);
+          addTaskRow.appendChild(addTaskBtn);
+          addTaskRow.addEventListener('click', (e) => e.stopPropagation());
+          panel.appendChild(addTaskRow);
 
           const exportBtn = document.createElement('button'); exportBtn.className = 'ghost icon'; exportBtn.style.marginTop = '10px'; exportBtn.style.marginLeft = '8px';
           exportBtn.textContent = 'Export CSV';
