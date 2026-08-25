@@ -2118,7 +2118,10 @@
 
   function activeCardsForSignoff(date){
     const allocByDate = computeAllocationsByDate();
-    return buildJobCardsForDate(date, allocByDate).map(c => {
+    const engineCards = buildJobCardsForDate(date, allocByDate);
+    const engineKeys = new Set(engineCards.map(c => c.buildId + '|' + c.taskId));
+    const manualCards = manualOnlyCardsForDate(date).filter(c => !engineKeys.has(c.buildId + '|' + c.taskId));
+    return engineCards.concat(manualCards).map(c => {
       const raw = state.builds.find(b => b.id === c.buildId);
       const person = state.people.find(p => p.id === c.assignedPersonId);
       const signedRec = (state.actuals[date] && state.actuals[date][c.buildId]) ? state.actuals[date][c.buildId][c.taskId] : null;
@@ -2128,7 +2131,8 @@
         dayFinished: !!(person && state.dayFinished[date] && state.dayFinished[date][person.id]),
         signedOff: !!signedRec, signedRec,
         actualHours: raw ? actualHoursFromJobCards(raw, c.taskId, date) : null,
-        actualComplete: raw ? allJobCardSubtasksComplete(raw, c.taskId) : false
+        actualComplete: raw ? allJobCardSubtasksComplete(raw, c.taskId) : false,
+        manualOnly: !!c.manualOnly
       };
     });
   }
@@ -2230,7 +2234,11 @@
         const raw = state.builds.find(b => b.id === c.buildId);
         const jrTask = jobCardSourceTask(raw, c.taskId);
         const assignment = raw ? raw.taskAssignments[c.taskId] : null;
-        const checklist = checklistForCard(jrTask, assignment, c.buildId, c.taskId, c.planned, date);
+        // A manual-only card (no engine allocation at all) has nothing real to window checklistForCard's hour
+        // range against — show exactly the sub-tasks that were manually added for this person/date instead.
+        const checklist = c.manualOnly
+          ? (jrTask ? jrTask.subtasks.filter(st => (st.manualAdds || []).some(m => m.personId === c.personId && m.date === date)) : [])
+          : checklistForCard(jrTask, assignment, c.buildId, c.taskId, c.planned, date);
 
         if (checklist.length === 0){
           const noChecklist = document.createElement('div'); noChecklist.className = 'dep-empty';
@@ -4307,6 +4315,39 @@
     return results;
   }
 
+  // Same idea as manualSubtaskCardsForDate but across every person — a manually-added task has no engine
+  // allocation at all, so it's otherwise invisible to anything built on buildJobCardsForDate (Sign-off,
+  // Archive). One synthetic card-shaped entry per (build, task, person) that has manual-adds for this date;
+  // callers should dedupe against their own real/engine cards by buildId+taskId first.
+  function manualOnlyCardsForDate(date){
+    const groups = new Map();
+    state.jobRecords.forEach(jr => {
+      const build = state.builds.find(b => b.jobRecordId === jr.id && !b.archived);
+      if (!build) return;
+      (jr.tasks || []).forEach(t => {
+        (t.subtasks || []).forEach(st => {
+          (st.manualAdds || []).forEach(m => {
+            if (m.date !== date) return;
+            const key = build.id + '|' + t.taskRefId + '|' + m.personId;
+            if (!groups.has(key)) groups.set(key, { buildId: build.id, taskId: t.taskRefId, personId: m.personId, items: [] });
+            groups.get(key).items.push(st);
+          });
+        });
+      });
+    });
+    return Array.from(groups.values()).map(g => {
+      const build = state.builds.find(b => b.id === g.buildId);
+      const eff = effectiveBuildData(build);
+      const task = state.tasks.find(t => t.id === g.taskId);
+      const hours = g.items.reduce((s, st) => s + (Number(st.standardTime) || 0), 0);
+      return {
+        buildId: g.buildId, taskId: g.taskId, taskName: task ? task.name : '(task)',
+        jobNumber: eff.jobNumber, dealer: eff.dealer, customer: eff.customer, machineType: eff.machineType,
+        hours, status: build.status, assignedPersonId: g.personId, secondaryPersonIds: [], date, manualOnly: true
+      };
+    });
+  }
+
   // Setup tasks this build's task must wait on, per the machine template/job it's scheduled from — shown in
   // the "moving this earlier" confirm so a supervisor can sanity-check those are actually done before starting.
   function taskDependencyNames(raw, taskId){
@@ -5551,7 +5592,17 @@
       if (obj.timerRunning){ timerBtn.style.background = 'var(--critical)'; timerBtn.style.borderColor = 'var(--critical)'; }
       else { timerBtn.style.background = 'var(--good)'; timerBtn.style.borderColor = 'var(--good)'; }
       timerBtn.textContent = obj.timerRunning ? '⏹ Stop' : '▶ Start';
-      timerBtn.addEventListener('click', () => { toggleSubtaskTimer(obj, person.id, date, taskIdForTimerObj(obj)); renderJobCardsLivePage(); });
+      timerBtn.addEventListener('click', () => {
+        // Starting a timer on something already marked complete is almost always a mistake (working on it
+        // again without realising it's still ticked done) — block it and make them consciously un-tick
+        // "Mark complete" first, rather than silently letting the clock run against a "finished" task.
+        if (!obj.timerRunning && obj.completed){
+          alert('This is marked complete. Un-tick "Mark complete" first if you need to log more time against it.');
+          return;
+        }
+        toggleSubtaskTimer(obj, person.id, date, taskIdForTimerObj(obj));
+        renderJobCardsLivePage();
+      });
       actions.appendChild(timerBtn);
 
       // Lets the employee see their running total on this task without having to stop it to find out — ticks
@@ -6206,7 +6257,10 @@
 
     const cutoff = jobCardsArchiveCutoff();
     const allocByDate = computeAllocationsByDate();
-    const archivedDates = Array.from(new Set([...allocByDate.keys(), ...state.adHocCards.map(c => c.date)]))
+    // A manually-added task has no engine allocation, so its date wouldn't otherwise show up here at all.
+    const manualAddDates = new Set();
+    state.jobRecords.forEach(jr => (jr.tasks || []).forEach(t => (t.subtasks || []).forEach(st => (st.manualAdds || []).forEach(m => manualAddDates.add(m.date)))));
+    const archivedDates = Array.from(new Set([...allocByDate.keys(), ...state.adHocCards.map(c => c.date), ...manualAddDates]))
       .filter(d => d < cutoff)
       .sort((a, b) => a < b ? 1 : a > b ? -1 : 0)
       .slice(0, ARCHIVE_MAX_DAYS);
@@ -6219,7 +6273,9 @@
     }
 
     archivedDates.forEach(date => {
-      const cards = buildJobCardsForDate(date, allocByDate);
+      const engineCards = buildJobCardsForDate(date, allocByDate);
+      const engineKeys = new Set(engineCards.map(c => c.buildId + '|' + c.taskId));
+      const cards = engineCards.concat(manualOnlyCardsForDate(date).filter(c => !engineKeys.has(c.buildId + '|' + c.taskId)));
       const adHoc = adHocCardsForDate(date);
       if (cards.length === 0 && adHoc.length === 0) return;
 
