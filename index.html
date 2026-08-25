@@ -2171,7 +2171,10 @@
 
   function renderSignoffFab(){
     const date = getTodayISO();
-    const pending = activeCardsForSignoff(date).filter(c => c.personId && c.dayFinished && !c.signedOff).length;
+    // Counts people waiting on a sign-off, not raw tasks — matches the one-row-per-person list this feeds.
+    const pending = new Set(
+      activeCardsForSignoff(date).filter(c => c.personId && c.dayFinished && !c.signedOff).map(c => c.personId)
+    ).size;
     const badge = document.getElementById('signoffBadge');
     if (pending > 0){ badge.style.display = ''; badge.textContent = String(pending); }
     else { badge.style.display = 'none'; }
@@ -2183,7 +2186,7 @@
     const date = jobCardsView.date;
 
     const dateWrap = document.createElement('div'); dateWrap.className = 'panel';
-    dateWrap.innerHTML = '<h2>Sign off time cards</h2><div class="hint">Every assigned card for the selected date. A card greys out until its employee marks their time card "Day finished" — sign off straight from the list using the best available data once it does, or click a card to review its checklist, correct the hours, or undo a sign-off.</div>';
+    dateWrap.innerHTML = '<h2>Sign off time cards</h2><div class="hint">One row per employee for the selected date, covering every job and task they touched — expand it to sign off each individually or use "Sign off all". A row greys out until that employee marks their time card "Day finished".</div>';
     renderJobCardsDatePicker(dateWrap, renderSignoffPage);
     container.appendChild(dateWrap);
 
@@ -2283,47 +2286,50 @@
 
     const list = document.createElement('div'); list.style.marginTop = '10px';
 
-    // Manually-added tasks for the same job (and same person) are grouped into one row — matching how they
-    // already appear grouped under one job card on the employee's own Job Card — with each task's own
-    // checklist/sign-off form nested underneath once expanded, rather than one separate row per task. Real
-    // engine-scheduled cards keep their existing one-row-per-task layout untouched.
-    const manualGroupOrder = [];
-    const manualGroups = new Map();
-    const singleCards = [];
+    // One row per employee per day — every job and task they touched that day nested inside once expanded,
+    // rather than a separate row per job or per task. Matches "Day finished" itself, which is already a single
+    // per-person flag, not a per-job one.
+    const personOrder = [];
+    const byPerson = new Map();
     cards.forEach(c => {
-      if (!c.manualOnly){ singleCards.push(c); return; }
-      const gkey = c.buildId + '|' + c.personId;
-      if (!manualGroups.has(gkey)){ manualGroups.set(gkey, []); manualGroupOrder.push(gkey); }
-      manualGroups.get(gkey).push(c);
+      if (!byPerson.has(c.personId)){ byPerson.set(c.personId, []); personOrder.push(c.personId); }
+      byPerson.get(c.personId).push(c);
     });
 
-    singleCards.forEach(c => {
-      const key = c.buildId + '|' + c.taskId;
+    personOrder.forEach(personId => {
+      const personCards = byPerson.get(personId);
+      const first = personCards[0];
+      const key = 'person|' + personId;
       const expanded = signoffExpanded.has(key);
       const rowWrap = document.createElement('div'); rowWrap.className = 'signoff-row';
-      if (!c.dayFinished && !c.signedOff) rowWrap.style.opacity = '0.5';
+      if (!first.dayFinished && !personCards.every(c => c.signedOff)) rowWrap.style.opacity = '0.5';
 
       const main = document.createElement('div'); main.className = 'signoff-row-main';
       const left = document.createElement('div');
-      left.innerHTML = `<div style="font-weight:600">${jobIdentityLabel(c.jobNumber, c.dealer, c.customer)} — ${c.taskName}</div>
-        <div class="drill-sub">${c.personName}${c.dayFinished ? ' · ✓ Day finished' : ''}</div>`;
+      const jobCount = new Set(personCards.map(c => c.buildId)).size;
+      left.innerHTML = `<div style="font-weight:600">${first.personName}</div>
+        <div class="drill-sub">${personCards.length} task${personCards.length === 1 ? '' : 's'} across ${jobCount} job${jobCount === 1 ? '' : 's'}${first.dayFinished ? ' · ✓ Day finished' : ''}</div>`;
       main.appendChild(left);
 
       const right = document.createElement('div'); right.style.display = 'flex'; right.style.alignItems = 'center'; right.style.gap = '8px';
-      const statusPill = document.createElement('span'); statusPill.className = 'pill ' + (c.signedOff ? 'ok' : 'stuck');
-      statusPill.textContent = c.signedOff ? 'Signed off' : 'Not signed off';
+      const signedCount = personCards.filter(c => c.signedOff).length;
+      const allSigned = signedCount === personCards.length;
+      const statusPill = document.createElement('span'); statusPill.className = 'pill ' + (allSigned ? 'ok' : 'stuck');
+      statusPill.textContent = allSigned ? 'Signed off' : `${signedCount}/${personCards.length} signed off`;
       right.appendChild(statusPill);
-      if (!c.signedOff){
+      if (!allSigned){
         const quickSignBtn = document.createElement('button'); quickSignBtn.className = 'primary'; quickSignBtn.style.padding = '4px 10px'; quickSignBtn.style.fontSize = '11.5px';
-        quickSignBtn.textContent = 'Sign off';
-        quickSignBtn.disabled = !c.dayFinished;
-        quickSignBtn.title = c.dayFinished
-          ? 'Sign off using the best available data (Job Cards clock hours if there are any, otherwise the planned hours) without opening the card.'
-          : `Waiting on ${c.personName} to mark their time card "Day finished" before this can be signed off.`;
+        quickSignBtn.textContent = 'Sign off all';
+        quickSignBtn.disabled = !first.dayFinished;
+        quickSignBtn.title = first.dayFinished
+          ? 'Sign off every not-yet-signed task for this person today using the best available data, without opening it.'
+          : `Waiting on ${first.personName} to mark their time card "Day finished" before this can be signed off.`;
         quickSignBtn.addEventListener('click', (e) => {
           e.stopPropagation();
-          const hours = c.actualHours != null ? c.actualHours : c.planned;
-          signOffCard(date, c.buildId, c.taskId, hours, c.actualComplete);
+          personCards.filter(c => !c.signedOff).forEach(c => {
+            const hours = c.actualHours != null ? c.actualHours : c.planned;
+            signOffCard(date, c.buildId, c.taskId, hours, c.actualComplete);
+          });
           renderSignoffPage(); renderSignoffFab();
           if (document.getElementById('page-schedule').style.display !== 'none') renderResults();
         });
@@ -2339,68 +2345,28 @@
       });
       rowWrap.appendChild(main);
 
-      if (expanded) rowWrap.appendChild(renderSignoffDetail(c));
-      list.appendChild(rowWrap);
-    });
-
-    manualGroupOrder.forEach(gkey => {
-      const group = manualGroups.get(gkey);
-      const first = group[0];
-      const groupKey = 'group|' + gkey;
-      const expanded = signoffExpanded.has(groupKey);
-      const rowWrap = document.createElement('div'); rowWrap.className = 'signoff-row';
-      const anyPending = group.some(c => !c.dayFinished && !c.signedOff);
-      if (anyPending) rowWrap.style.opacity = '0.5';
-
-      const main = document.createElement('div'); main.className = 'signoff-row-main';
-      const left = document.createElement('div');
-      left.innerHTML = `<div style="font-weight:600">${jobIdentityLabel(first.jobNumber, first.dealer, first.customer)} — ${group.length} task${group.length === 1 ? '' : 's'} added</div>
-        <div class="drill-sub">${first.personName}${first.dayFinished ? ' · ✓ Day finished' : ''}</div>`;
-      main.appendChild(left);
-
-      const right = document.createElement('div'); right.style.display = 'flex'; right.style.alignItems = 'center'; right.style.gap = '8px';
-      const signedCount = group.filter(c => c.signedOff).length;
-      const allSigned = signedCount === group.length;
-      const statusPill = document.createElement('span'); statusPill.className = 'pill ' + (allSigned ? 'ok' : 'stuck');
-      statusPill.textContent = allSigned ? 'Signed off' : `${signedCount}/${group.length} signed off`;
-      right.appendChild(statusPill);
-      if (!allSigned){
-        const quickSignBtn = document.createElement('button'); quickSignBtn.className = 'primary'; quickSignBtn.style.padding = '4px 10px'; quickSignBtn.style.fontSize = '11.5px';
-        quickSignBtn.textContent = 'Sign off all';
-        quickSignBtn.disabled = !first.dayFinished;
-        quickSignBtn.title = first.dayFinished
-          ? 'Sign off every not-yet-signed task in this job using the best available data, without opening it.'
-          : `Waiting on ${first.personName} to mark their time card "Day finished" before this can be signed off.`;
-        quickSignBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          group.filter(c => !c.signedOff).forEach(c => {
-            const hours = c.actualHours != null ? c.actualHours : c.planned;
-            signOffCard(date, c.buildId, c.taskId, hours, c.actualComplete);
-          });
-          renderSignoffPage(); renderSignoffFab();
-          if (document.getElementById('page-schedule').style.display !== 'none') renderResults();
-        });
-        right.appendChild(quickSignBtn);
-      }
-      const chevron = document.createElement('span'); chevron.className = 'drill-meta'; chevron.textContent = expanded ? '▾' : '▸';
-      right.appendChild(chevron);
-      main.appendChild(right);
-      main.addEventListener('click', (e) => {
-        e.stopPropagation();
-        if (expanded) signoffExpanded.delete(groupKey); else signoffExpanded.add(groupKey);
-        renderSignoffPage();
-      });
-      rowWrap.appendChild(main);
-
       if (expanded){
-        const groupDetail = document.createElement('div'); groupDetail.className = 'signoff-row-detail';
-        group.forEach(c => {
-          const taskHeading = document.createElement('div'); taskHeading.style.fontWeight = '600'; taskHeading.style.marginTop = '6px';
-          taskHeading.textContent = c.taskName;
-          groupDetail.appendChild(taskHeading);
-          groupDetail.appendChild(renderSignoffDetail(c));
+        const detailWrap = document.createElement('div'); detailWrap.className = 'signoff-row-detail';
+        const byJob = new Map();
+        const jobOrder = [];
+        personCards.forEach(c => {
+          if (!byJob.has(c.buildId)){ byJob.set(c.buildId, []); jobOrder.push(c.buildId); }
+          byJob.get(c.buildId).push(c);
         });
-        rowWrap.appendChild(groupDetail);
+        jobOrder.forEach(buildId => {
+          const jobCards = byJob.get(buildId);
+          const jc = jobCards[0];
+          const jobHeading = document.createElement('div'); jobHeading.style.fontWeight = '700'; jobHeading.style.marginTop = '10px';
+          jobHeading.textContent = jobIdentityLabel(jc.jobNumber, jc.dealer, jc.customer);
+          detailWrap.appendChild(jobHeading);
+          jobCards.forEach(c => {
+            const taskHeading = document.createElement('div'); taskHeading.style.fontWeight = '600'; taskHeading.style.marginTop = '6px';
+            taskHeading.textContent = c.taskName;
+            detailWrap.appendChild(taskHeading);
+            detailWrap.appendChild(renderSignoffDetail(c));
+          });
+        });
+        rowWrap.appendChild(detailWrap);
       }
       list.appendChild(rowWrap);
     });
