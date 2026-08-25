@@ -3593,7 +3593,28 @@
     if (today !== lastKnownToday){
       if (jobCardsView.date === lastKnownToday) jobCardsView.date = today;
       lastKnownToday = today;
+      autoStopOvernightTimers();
     }
+  }
+
+  // Anyone who left a timer running overnight never got a chance to hit Stop before the day rolled over —
+  // stop it at 23:59 of the day it actually ran (not "now", which could be much later if a tab wasn't open at
+  // midnight) and flag the session so the timesheet makes clear it isn't a real end time, rather than quietly
+  // fabricating hours all the way through to whenever this happened to run.
+  function autoStopOvernightTimers(){
+    const today = getTodayISO();
+    let changed = false;
+    forEachTimerObj((obj) => {
+      if (!obj.timerRunning) return;
+      const open = [...(obj.timeLogs || [])].reverse().find(tl => !tl.stopTime);
+      if (!open || !open.date || open.date >= today) return;
+      open.stopTime = '23:59';
+      open.autoStopped = true;
+      obj.timerRunning = false;
+      changed = true;
+    });
+    if (changed) save();
+    return changed;
   }
 
   // The oldest date still shown live — anything older belongs in the Archive tab.
@@ -5521,10 +5542,17 @@
       const tbody = document.createElement('tbody');
       visibleLogs.forEach(tl => {
         const tr = document.createElement('tr');
+        if (tl.autoStopped) tr.title = 'Auto clocked out at 23:59 — this person never hit Stop, so the real finish time is unknown.';
         const tdDate = document.createElement('td');
         const dateInp = document.createElement('input'); dateInp.type = 'date'; dateInp.value = tl.date || '';
         dateInp.addEventListener('change', () => { tl.date = dateInp.value; save(); });
-        tdDate.appendChild(dateInp); tr.appendChild(tdDate);
+        tdDate.appendChild(dateInp);
+        if (tl.autoStopped){
+          const warn = document.createElement('div'); warn.className = 'hint'; warn.style.color = 'var(--warn, #b45309)';
+          warn.textContent = '⚠ auto clocked out — forgot to stop';
+          tdDate.appendChild(warn);
+        }
+        tr.appendChild(tdDate);
 
         const tdWho = document.createElement('td');
         // Reassigning a session to someone else is a manager-only move — floor logins just see who it's under.
@@ -5547,12 +5575,12 @@
 
         const tdStart = document.createElement('td');
         const startInp = document.createElement('input'); startInp.type = 'time'; startInp.value = tl.startTime || '';
-        startInp.addEventListener('change', () => { tl.startTime = startInp.value; save(); renderJobCardsLivePage(); });
+        startInp.addEventListener('change', () => { tl.startTime = startInp.value; delete tl.autoStopped; save(); renderJobCardsLivePage(); });
         tdStart.appendChild(startInp); tr.appendChild(tdStart);
 
         const tdStop = document.createElement('td');
         const stopInp = document.createElement('input'); stopInp.type = 'time'; stopInp.value = tl.stopTime || '';
-        stopInp.addEventListener('change', () => { tl.stopTime = stopInp.value; save(); renderJobCardsLivePage(); });
+        stopInp.addEventListener('change', () => { tl.stopTime = stopInp.value; delete tl.autoStopped; save(); renderJobCardsLivePage(); });
         tdStop.appendChild(stopInp); tr.appendChild(tdStop);
 
         const tdHours = document.createElement('td'); tdHours.textContent = Math.round(logEntryHours(tl, obj) * 100) / 100 + 'h';
