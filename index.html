@@ -6575,6 +6575,10 @@
   }
 
   let archiveExpanded = new Set();
+  // 'job' (default, as before) lists one row per job/task card under each date. 'person' regroups the same
+  // data by who did it, one row per person per date — "as their job card was on that day" — instead of one
+  // row per job.
+  let archiveViewMode = 'job';
 
   // A simplified, read-only report of what actually happened on this one card that day — not the live,
   // editable Job Card (Start/Stop, ticking checkboxes, etc.), which doesn't make sense for history anyway
@@ -6682,6 +6686,20 @@
     filterRow.appendChild(clearBtn);
     panel.appendChild(filterRow);
 
+    const viewRow = document.createElement('div'); viewRow.className = 'field-row'; viewRow.style.marginTop = '10px';
+    const viewLabel = document.createElement('label'); viewLabel.textContent = 'Archive by';
+    viewRow.appendChild(viewLabel);
+    const byJobBtn = document.createElement('button'); byJobBtn.className = archiveViewMode === 'job' ? 'primary' : 'ghost';
+    byJobBtn.textContent = 'Job card';
+    byJobBtn.addEventListener('click', () => { archiveViewMode = 'job'; renderArchivePage(); });
+    viewRow.appendChild(byJobBtn);
+    const byPersonBtn = document.createElement('button'); byPersonBtn.className = archiveViewMode === 'person' ? 'primary' : 'ghost';
+    byPersonBtn.textContent = 'Person';
+    byPersonBtn.title = 'Group by who did the work — one row per person per date, as their job card was that day.';
+    byPersonBtn.addEventListener('click', () => { archiveViewMode = 'person'; renderArchivePage(); });
+    viewRow.appendChild(byPersonBtn);
+    panel.appendChild(viewRow);
+
     const exportAllBtn = document.createElement('button'); exportAllBtn.className = 'ghost icon'; exportAllBtn.style.marginTop = '10px';
     exportAllBtn.textContent = 'Export filtered date range (CSV)';
     panel.appendChild(exportAllBtn);
@@ -6726,66 +6744,153 @@
         .filter(c => !archiveFilters.personId || c.personId === archiveFilters.personId);
       if (cards.length === 0 && adHoc.length === 0) return;
       anyShown = true;
+      cards.forEach(c => allExportRows.push(archiveCardCsvRow(c, date)));
 
       const datePanel = document.createElement('div'); datePanel.className = 'panel'; datePanel.style.marginTop = '12px';
       datePanel.innerHTML = `<h2>${fmtDateLong(date)}</h2>`;
       const list = document.createElement('div'); list.className = 'drill-list'; list.style.marginTop = '10px';
-      cards.forEach(c => {
-        allExportRows.push(archiveCardCsvRow(c, date));
-        const signedRec = (state.actuals[date] && state.actuals[date][c.buildId]) ? state.actuals[date][c.buildId][c.taskId] : null;
-        const cardKey = date + '|' + c.buildId + '|' + c.taskId;
-        const expanded = archiveExpanded.has(cardKey);
-        const rowWrap = document.createElement('div'); rowWrap.className = 'signoff-row';
-        const main = document.createElement('div'); main.className = 'signoff-row-main';
-        main.addEventListener('click', () => {
-          if (expanded) archiveExpanded.delete(cardKey); else archiveExpanded.add(cardKey);
-          renderArchivePage();
-        });
-        const left = document.createElement('div'); left.className = 'drill-main';
-        left.textContent = `${jobIdentityLabel(c.jobNumber, c.dealer, c.customer)} — ${c.taskName}`;
-        main.appendChild(left);
-        const rightWrap = document.createElement('div'); rightWrap.style.display = 'flex'; rightWrap.style.alignItems = 'center'; rightWrap.style.gap = '10px';
-        const meta = document.createElement('div'); meta.className = 'drill-meta';
-        const assignedPerson = state.people.find(p => p.id === c.assignedPersonId);
-        meta.textContent = `${c.machineType || ''} · ${c.hours}h · ${c.status || 'scheduled'}${assignedPerson ? ' · ' + assignedPerson.name : ''}`;
-        rightWrap.appendChild(meta);
-        const signPill = document.createElement('span'); signPill.className = 'pill ' + (signedRec ? 'ok' : 'stuck');
-        signPill.textContent = signedRec ? `Signed off — ${signedRec.hours}h` : 'Not signed off';
-        rightWrap.appendChild(signPill);
-        if (signedRec){
-          const reactivateBtn = document.createElement('button'); reactivateBtn.className = 'ghost icon';
-          reactivateBtn.textContent = '↩ Reactivate';
-          reactivateBtn.title = 'Undo this sign-off — sends it back to Sign Off as pending.';
-          reactivateBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            if (!confirm(`Undo the sign-off for ${jobIdentityLabel(c.jobNumber, c.dealer, c.customer)} — ${c.taskName} on ${fmtDateLong(date)}?`)) return;
-            undoSignOffCard(date, c.buildId, c.taskId);
-            renderArchivePage(); renderSignoffFab();
+
+      if (archiveViewMode === 'job'){
+        cards.forEach(c => {
+          const signedRec = (state.actuals[date] && state.actuals[date][c.buildId]) ? state.actuals[date][c.buildId][c.taskId] : null;
+          const cardKey = date + '|' + c.buildId + '|' + c.taskId;
+          const expanded = archiveExpanded.has(cardKey);
+          const rowWrap = document.createElement('div'); rowWrap.className = 'signoff-row';
+          const main = document.createElement('div'); main.className = 'signoff-row-main';
+          main.addEventListener('click', () => {
+            if (expanded) archiveExpanded.delete(cardKey); else archiveExpanded.add(cardKey);
+            renderArchivePage();
           });
-          rightWrap.appendChild(reactivateBtn);
-        }
-        const exportBtn = document.createElement('button'); exportBtn.className = 'icon ghost'; exportBtn.textContent = '⤓';
-        exportBtn.title = 'Export this card (CSV)';
-        exportBtn.addEventListener('click', (e) => { e.stopPropagation(); exportArchiveCard(c, date); });
-        rightWrap.appendChild(exportBtn);
-        const chevron = document.createElement('span'); chevron.className = 'drill-meta'; chevron.textContent = expanded ? '▾' : '▸';
-        rightWrap.appendChild(chevron);
-        main.appendChild(rightWrap);
-        rowWrap.appendChild(main);
-        if (expanded) renderArchiveCardReport(rowWrap, c, date);
-        list.appendChild(rowWrap);
-      });
-      adHoc.forEach(c => {
-        const row = document.createElement('div'); row.className = 'drill-row'; row.style.cursor = 'default';
-        const main = document.createElement('div'); main.className = 'drill-main';
-        main.textContent = adHocCardTitle(c);
-        row.appendChild(main);
-        const meta = document.createElement('div'); meta.className = 'drill-meta';
-        const person = state.people.find(p => p.id === c.personId);
-        meta.textContent = `${c.hours}h · ${person ? person.name : '(unassigned)'}${c.completed ? ' · Done' : ''}`;
-        row.appendChild(meta);
-        list.appendChild(row);
-      });
+          const left = document.createElement('div'); left.className = 'drill-main';
+          left.textContent = `${jobIdentityLabel(c.jobNumber, c.dealer, c.customer)} — ${c.taskName}`;
+          main.appendChild(left);
+          const rightWrap = document.createElement('div'); rightWrap.style.display = 'flex'; rightWrap.style.alignItems = 'center'; rightWrap.style.gap = '10px';
+          const meta = document.createElement('div'); meta.className = 'drill-meta';
+          const assignedPerson = state.people.find(p => p.id === c.assignedPersonId);
+          meta.textContent = `${c.machineType || ''} · ${c.hours}h · ${c.status || 'scheduled'}${assignedPerson ? ' · ' + assignedPerson.name : ''}`;
+          rightWrap.appendChild(meta);
+          const signPill = document.createElement('span'); signPill.className = 'pill ' + (signedRec ? 'ok' : 'stuck');
+          signPill.textContent = signedRec ? `Signed off — ${signedRec.hours}h` : 'Not signed off';
+          rightWrap.appendChild(signPill);
+          if (signedRec){
+            const reactivateBtn = document.createElement('button'); reactivateBtn.className = 'ghost icon';
+            reactivateBtn.textContent = '↩ Reactivate';
+            reactivateBtn.title = 'Undo this sign-off — sends it back to Sign Off as pending.';
+            reactivateBtn.addEventListener('click', (e) => {
+              e.stopPropagation();
+              if (!confirm(`Undo the sign-off for ${jobIdentityLabel(c.jobNumber, c.dealer, c.customer)} — ${c.taskName} on ${fmtDateLong(date)}?`)) return;
+              undoSignOffCard(date, c.buildId, c.taskId);
+              renderArchivePage(); renderSignoffFab();
+            });
+            rightWrap.appendChild(reactivateBtn);
+          }
+          const exportBtn = document.createElement('button'); exportBtn.className = 'icon ghost'; exportBtn.textContent = '⤓';
+          exportBtn.title = 'Export this card (CSV)';
+          exportBtn.addEventListener('click', (e) => { e.stopPropagation(); exportArchiveCard(c, date); });
+          rightWrap.appendChild(exportBtn);
+          const chevron = document.createElement('span'); chevron.className = 'drill-meta'; chevron.textContent = expanded ? '▾' : '▸';
+          rightWrap.appendChild(chevron);
+          main.appendChild(rightWrap);
+          rowWrap.appendChild(main);
+          if (expanded) renderArchiveCardReport(rowWrap, c, date);
+          list.appendChild(rowWrap);
+        });
+        adHoc.forEach(c => {
+          const row = document.createElement('div'); row.className = 'drill-row'; row.style.cursor = 'default';
+          const main = document.createElement('div'); main.className = 'drill-main';
+          main.textContent = adHocCardTitle(c);
+          row.appendChild(main);
+          const meta = document.createElement('div'); meta.className = 'drill-meta';
+          const person = state.people.find(p => p.id === c.personId);
+          meta.textContent = `${c.hours}h · ${person ? person.name : '(unassigned)'}${c.completed ? ' · Done' : ''}`;
+          row.appendChild(meta);
+          list.appendChild(row);
+        });
+      } else {
+        // Person view: everyone who has a card or ad-hoc entry this date gets one row — "as their job card
+        // was on that day" — heading combines person + date, expanding into every job/task nested underneath
+        // (each still using the same simplified report), rather than one row per job.
+        const byPerson = new Map();
+        const personOrder = [];
+        cards.forEach(c => {
+          const pid = c.assignedPersonId || '__unassigned__';
+          if (!byPerson.has(pid)){ byPerson.set(pid, { jobs: [], adHoc: [] }); personOrder.push(pid); }
+          byPerson.get(pid).jobs.push(c);
+        });
+        adHoc.forEach(c => {
+          const pid = c.personId || '__unassigned__';
+          if (!byPerson.has(pid)){ byPerson.set(pid, { jobs: [], adHoc: [] }); personOrder.push(pid); }
+          byPerson.get(pid).adHoc.push(c);
+        });
+
+        personOrder.forEach(pid => {
+          const group = byPerson.get(pid);
+          const person = pid === '__unassigned__' ? null : state.people.find(p => p.id === pid);
+          const personName = person ? (person.name || '(unnamed)') : '(unassigned)';
+          const key = 'person|' + date + '|' + pid;
+          const expanded = archiveExpanded.has(key);
+          const totalHours = group.jobs.reduce((s, c) => s + (Number(c.hours) || 0), 0) + group.adHoc.reduce((s, c) => s + (Number(c.hours) || 0), 0);
+          const itemCount = group.jobs.length + group.adHoc.length;
+
+          const rowWrap = document.createElement('div'); rowWrap.className = 'signoff-row';
+          const main = document.createElement('div'); main.className = 'signoff-row-main';
+          main.addEventListener('click', () => {
+            if (expanded) archiveExpanded.delete(key); else archiveExpanded.add(key);
+            renderArchivePage();
+          });
+          const left = document.createElement('div'); left.className = 'drill-main';
+          left.textContent = `${personName} — ${fmtDateLong(date)}`;
+          main.appendChild(left);
+          const rightWrap = document.createElement('div'); rightWrap.style.display = 'flex'; rightWrap.style.alignItems = 'center'; rightWrap.style.gap = '10px';
+          const meta = document.createElement('div'); meta.className = 'drill-meta';
+          meta.textContent = `${itemCount} job${itemCount === 1 ? '' : 's'} · ${Math.round(totalHours * 100) / 100}h`;
+          rightWrap.appendChild(meta);
+          const chevron = document.createElement('span'); chevron.className = 'drill-meta'; chevron.textContent = expanded ? '▾' : '▸';
+          rightWrap.appendChild(chevron);
+          main.appendChild(rightWrap);
+          rowWrap.appendChild(main);
+
+          if (expanded){
+            const detailWrap = document.createElement('div'); detailWrap.className = 'signoff-row-detail';
+            group.jobs.forEach(c => {
+              const signedRec = (state.actuals[date] && state.actuals[date][c.buildId]) ? state.actuals[date][c.buildId][c.taskId] : null;
+              const jobRow = document.createElement('div'); jobRow.style.display = 'flex'; jobRow.style.alignItems = 'center'; jobRow.style.justifyContent = 'space-between'; jobRow.style.gap = '10px'; jobRow.style.marginTop = '10px';
+              const jobHeading = document.createElement('div'); jobHeading.style.fontWeight = '700';
+              jobHeading.textContent = `${jobIdentityLabel(c.jobNumber, c.dealer, c.customer)} — ${c.taskName}`;
+              jobRow.appendChild(jobHeading);
+              const jobRight = document.createElement('div'); jobRight.style.display = 'flex'; jobRight.style.alignItems = 'center'; jobRight.style.gap = '8px';
+              const signPill = document.createElement('span'); signPill.className = 'pill ' + (signedRec ? 'ok' : 'stuck');
+              signPill.textContent = signedRec ? `Signed off — ${signedRec.hours}h` : 'Not signed off';
+              jobRight.appendChild(signPill);
+              if (signedRec){
+                const reactivateBtn = document.createElement('button'); reactivateBtn.className = 'ghost icon';
+                reactivateBtn.textContent = '↩ Reactivate';
+                reactivateBtn.addEventListener('click', () => {
+                  if (!confirm(`Undo the sign-off for ${jobIdentityLabel(c.jobNumber, c.dealer, c.customer)} — ${c.taskName} on ${fmtDateLong(date)}?`)) return;
+                  undoSignOffCard(date, c.buildId, c.taskId);
+                  renderArchivePage(); renderSignoffFab();
+                });
+                jobRight.appendChild(reactivateBtn);
+              }
+              const exportBtn = document.createElement('button'); exportBtn.className = 'icon ghost'; exportBtn.textContent = '⤓';
+              exportBtn.title = 'Export this card (CSV)';
+              exportBtn.addEventListener('click', () => exportArchiveCard(c, date));
+              jobRight.appendChild(exportBtn);
+              jobRow.appendChild(jobRight);
+              detailWrap.appendChild(jobRow);
+              renderArchiveCardReport(detailWrap, c, date);
+            });
+            group.adHoc.forEach(c => {
+              const adRow = document.createElement('div'); adRow.style.marginTop = '10px';
+              adRow.innerHTML = `<div style="font-weight:700">${adHocCardTitle(c)}</div><div class="drill-meta">${c.hours}h${c.completed ? ' · Done' : ''}</div>`;
+              detailWrap.appendChild(adRow);
+            });
+            rowWrap.appendChild(detailWrap);
+          }
+          list.appendChild(rowWrap);
+        });
+      }
+
       datePanel.appendChild(list);
       container.appendChild(datePanel);
     });
