@@ -1860,8 +1860,8 @@
       <td>${b.dealer || '—'}</td>
       <td>${b.customer || '—'}</td>
       <td>${b.machineType || '—'}</td>
-      <td class="num">${b.orderDate ? fmtShort(parseISO(b.orderDate)) : '—'}</td>
       <td class="num">${b.buildSheetReleaseDate ? fmtShort(parseISO(b.buildSheetReleaseDate)) : '—'}</td>
+      <td class="num">${b.orderDate ? fmtShort(parseISO(b.orderDate)) : '—'}</td>
       <td class="num">${b.startDate ? fmtShort(parseISO(b.startDate)) : '—'}</td>
       <td class="num">${dispatchDate ? fmtShort(parseISO(dispatchDate)) : '—'}</td>
       <td class="num">${workDaySpan}</td>
@@ -3106,7 +3106,7 @@
     const sumTable = document.createElement('table');
     sumTable.className = 'build-summary';
     sumTable.innerHTML = `<thead><tr>
-      <th>Job #</th><th>Dealer</th><th>Customer</th><th>Machine type</th><th>Order date</th><th title="When the build sheet needs to be released to stay on track for the earliest start date">Build sheet release</th><th>Start</th><th>Dispatch</th><th>Working days</th><th title="Hours used / hours remaining / % complete">Progress</th><th title="Every hour actually logged on the check sheet for this job — can run higher than scheduled if a task took longer than planned">Actual hours used</th><th>Status</th><th></th>
+      <th>Job #</th><th>Dealer</th><th>Customer</th><th>Machine type</th><th title="When the build sheet needs to be released to stay on track for the earliest start date">Build sheet release</th><th>Order date</th><th>Start</th><th>Dispatch</th><th>Working days</th><th title="Hours used / hours remaining / % complete">Progress</th><th title="Every hour actually logged on the check sheet for this job — can run higher than scheduled if a task took longer than planned">Actual hours used</th><th>Status</th><th></th>
     </tr></thead>`;
     const sumBody = document.createElement('tbody');
 
@@ -3351,7 +3351,7 @@
     table.className = 'build-summary';
     table.style.marginTop = '10px';
     table.innerHTML = `<thead><tr>
-      <th>Job #</th><th>Dealer</th><th>Customer</th><th>Machine type</th><th>Order date</th><th title="When the build sheet needs to be released to stay on track for the earliest start date">Build sheet release</th><th>Start</th><th>Dispatch</th><th>Working days</th><th title="Hours used / hours remaining / % complete">Progress</th><th title="Every hour actually logged on the check sheet for this job — can run higher than scheduled if a task took longer than planned">Actual hours used</th><th>Date completed</th>
+      <th>Job #</th><th>Dealer</th><th>Customer</th><th>Machine type</th><th title="When the build sheet needs to be released to stay on track for the earliest start date">Build sheet release</th><th>Order date</th><th>Start</th><th>Dispatch</th><th>Working days</th><th title="Hours used / hours remaining / % complete">Progress</th><th title="Every hour actually logged on the check sheet for this job — can run higher than scheduled if a task took longer than planned">Actual hours used</th><th>Date completed</th>
     </tr></thead>`;
     const tbody = document.createElement('tbody');
 
@@ -3410,7 +3410,7 @@
     table.className = 'build-summary';
     table.style.marginTop = '10px';
     table.innerHTML = `<thead><tr>
-      <th>Job #</th><th>Dealer</th><th>Customer</th><th>Machine type</th><th>Order date</th><th title="When the build sheet needs to be released to stay on track for the earliest start date">Build sheet release</th><th>Start</th><th>Dispatch</th><th>Working days</th><th title="Hours used / hours remaining / % complete">Progress</th><th title="Every hour actually logged on the check sheet for this job — can run higher than scheduled if a task took longer than planned">Actual hours used</th><th>Date completed</th>
+      <th>Job #</th><th>Dealer</th><th>Customer</th><th>Machine type</th><th title="When the build sheet needs to be released to stay on track for the earliest start date">Build sheet release</th><th>Order date</th><th>Start</th><th>Dispatch</th><th>Working days</th><th title="Hours used / hours remaining / % complete">Progress</th><th title="Every hour actually logged on the check sheet for this job — can run higher than scheduled if a task took longer than planned">Actual hours used</th><th>Date completed</th>
     </tr></thead>`;
     const tbody = document.createElement('tbody');
 
