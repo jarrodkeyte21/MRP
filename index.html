@@ -324,6 +324,7 @@
     text-transform: uppercase; letter-spacing: 0.04em; border: none; cursor: pointer; font-weight: 700;
   }
   select.status-scheduled { background: var(--surface-2); color: var(--ink-muted); }
+  select.status-build_sheet_released { background: #7D6BAE; color: #fff; }
   select.status-ordered { background: var(--accent); color: var(--accent-ink); }
   select.status-received { background: #4A5C8C; color: #fff; }
   select.status-in_production { background: var(--warn); color: #1B2126; }
@@ -533,6 +534,7 @@
   const PALETTE = ['#2E6E86','#C97A2B','#7A8C3F','#8E5AA0','#4A5C8C','#B5533F','#3E8EA8','#A85D8C'];
   const BUILD_STATUSES = [
     { id: 'scheduled', label: 'Scheduled' },
+    { id: 'build_sheet_released', label: 'Build Sheet Released' },
     { id: 'ordered', label: 'Ordered' },
     { id: 'received', label: 'Received' },
     { id: 'in_production', label: 'In Production' },
@@ -3244,7 +3246,9 @@
             td.appendChild(seg);
           });
         } else if (onHold){
-          const placed = b.status !== 'scheduled';
+          // Build Sheet Released sits before the materials order is actually placed (same as Scheduled), so it
+          // shouldn't flip this block to "confirmed" the way Ordered/Received/In Production/Complete do.
+          const placed = !['scheduled', 'build_sheet_released'].includes(b.status);
           const seg = document.createElement('div');
           seg.className = 'seg seg-hold' + (placed ? ' seg-hold-confirmed' : '');
           seg.textContent = 'ORDERED';
