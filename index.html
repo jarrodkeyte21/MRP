@@ -4362,24 +4362,32 @@
   // only gets whichever ones fall inside its own [hours already worked on earlier days, + this day's hours)
   // window — the rest stay in the pool for whichever day they actually land on. A manager can deliberately
   // overschedule a day by adding a sub-task beyond that window (assignment.extraSubtasksByDate); those always
-  // show regardless, and already-completed sub-tasks are never re-offered on a later day.
+  // show regardless.
+  //
+  // A sub-task already finished on a DIFFERENT day is taken off the timeline entirely (doesn't advance the
+  // cursor, can't land in any window) rather than merely hidden from the result — the scheduling engine always
+  // re-simulates a task's remaining hours starting fresh from "today" (computeAllocationsByDate never looks
+  // further back than that), so `windowStart` comes back 0 again on a later day even once real work already
+  // happened. Left unhandled, that keeps landing the window back on the very start of the sub-task list,
+  // re-offering something that's genuinely done and re-counting its hours into this day's total. Taking it off
+  // the timeline lets whatever's actually still outstanding compact forward into view instead. A sub-task
+  // finished ON this exact day (it has a timeLog dated `date`) still counts normally — ticking it complete
+  // doesn't make it vanish off the very card it was just worked on.
   function checklistForCard(jrTask, assignment, buildId, taskId, hours, date){
     const excluded = new Set(assignment ? assignment.excludedSubtasks : []);
     const extra = new Set((assignment && assignment.extraSubtasksByDate && assignment.extraSubtasksByDate[date]) || []);
-    // Walk EVERY selected sub-task (not just the not-excluded ones) so the cursor stays stable — excluding one
-    // sub-task must not shift where every later sub-task's window falls, or ticking/unticking one checkbox
-    // silently flips others. Completion doesn't exclude a sub-task either — its window position already
-    // confines it to its own day regardless of whether it's ticked, so "complete" shouldn't make it vanish.
     const allSelected = (jrTask ? jrTask.subtasks : []).filter(st => st.selected);
     const windowStart = date ? hoursBeforeDate(buildId, taskId, date) : 0;
     const windowEnd = windowStart + (Number(hours) || 0);
     let cursor = 0;
     const result = [];
     allSelected.forEach(st => {
+      if (extra.has(st.id)){ result.push(st); return; }
+      const staleComplete = date && st.completed && !(st.timeLogs || []).some(tl => tl.date === date);
+      if (staleComplete) return; // done on some earlier day — no longer occupies a slot on the timeline
       const start = cursor;
       cursor += Number(st.standardTime) || 0;
       if (excluded.has(st.id)) return;
-      if (extra.has(st.id)){ result.push(st); return; }
       if (start < windowEnd && cursor > windowStart) result.push(st);
     });
     return result;
