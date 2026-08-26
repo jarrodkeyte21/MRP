@@ -6775,7 +6775,7 @@
         printAllBtn.textContent = '🖨 Print cards for this date…';
         printAllBtn.addEventListener('click', () => {
           if (!peopleWithWork.length){ alert('Nothing to print — no one has work on this date yet.'); return; }
-          printSelectedPeople = new Set(peopleWithWork.map(p => p.id)); // everyone pre-selected — one click still prints all
+          printSelectedPeople = new Set(); // nobody pre-selected — pick who actually needs paper today
           printSelectExpanded = true;
           renderJobCardsLivePage();
         });
