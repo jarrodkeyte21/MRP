@@ -5649,6 +5649,8 @@
   let peopleSectionExpanded = new Set();
   let jobCardsLiveSessionsExpanded = new Set();
   let jobCardsAddWorkExpanded = new Set();
+  let printSelectExpanded = false;
+  let printSelectedPeople = new Set();
 
   function nowTimeHHMM(){
     const d = new Date();
@@ -6708,24 +6710,78 @@
       }
     } else {
       listPanel.innerHTML = '<h2>Employees</h2>';
-      // A paper fallback for a broken tablet or a new starter without a login yet — prints every person's card
-      // for the selected date in one go (one page each), left blank for hand completion and keyed back in later.
-      const printAllRow = document.createElement('div'); printAllRow.style.marginTop = '6px';
-      const printAllBtn = document.createElement('button'); printAllBtn.className = 'ghost icon';
-      printAllBtn.textContent = '🖨 Print all cards for this date';
-      printAllBtn.addEventListener('click', () => {
-        const peopleWithWork = sortedPeople().filter(p => {
-          const sent = isPersonDateLocked(p.id, jobCardsView.date);
-          const hasCards = sent && buildJobCardsForDate(jobCardsView.date).some(c => isCardForPerson(c, p.id));
-          const hasAdHoc = adHocCardsForDate(jobCardsView.date).some(c => c.personId === p.id);
-          const hasManual = manualSubtaskCardsForDate(p, jobCardsView.date).length > 0;
-          return hasCards || hasAdHoc || hasManual;
-        });
-        if (!peopleWithWork.length){ alert('Nothing to print — no one has work on this date yet.'); return; }
-        printAllJobCards(jobCardsView.date, peopleWithWork);
+      // A paper fallback for a broken tablet or a new starter without a login yet — prints one or more
+      // people's cards for the selected date (one page each), left blank for hand completion and keyed back in
+      // later. Collapsed to a single button by default; opening it offers a per-person checklist (everyone with
+      // work today pre-ticked) so a manager can print just the one or two people who actually need paper today
+      // instead of the whole crew.
+      const peopleWithWork = sortedPeople().filter(p => {
+        const sent = isPersonDateLocked(p.id, jobCardsView.date);
+        const hasCards = sent && buildJobCardsForDate(jobCardsView.date).some(c => isCardForPerson(c, p.id));
+        const hasAdHoc = adHocCardsForDate(jobCardsView.date).some(c => c.personId === p.id);
+        const hasManual = manualSubtaskCardsForDate(p, jobCardsView.date).length > 0;
+        return hasCards || hasAdHoc || hasManual;
       });
-      printAllRow.appendChild(printAllBtn);
-      listPanel.appendChild(printAllRow);
+      const printWrap = document.createElement('div'); printWrap.style.marginTop = '6px';
+      if (printSelectExpanded){
+        const panel = document.createElement('div'); panel.style.border = '1px solid var(--line)'; panel.style.borderRadius = '6px'; panel.style.padding = '10px';
+        const heading = document.createElement('div'); heading.style.fontWeight = '700'; heading.style.marginBottom = '6px';
+        heading.textContent = 'Print cards for this date';
+        panel.appendChild(heading);
+        if (!peopleWithWork.length){
+          const empty = document.createElement('div'); empty.className = 'dep-empty';
+          empty.textContent = 'Nothing to print — no one has work on this date yet.';
+          panel.appendChild(empty);
+        } else {
+          const listWrap = document.createElement('div'); listWrap.className = 'dep-list';
+          peopleWithWork.forEach(p => {
+            const label = document.createElement('label'); label.className = 'dep-item';
+            const pcb = document.createElement('input'); pcb.type = 'checkbox';
+            pcb.checked = printSelectedPeople.has(p.id);
+            pcb.addEventListener('change', () => {
+              if (pcb.checked) printSelectedPeople.add(p.id); else printSelectedPeople.delete(p.id);
+            });
+            label.appendChild(pcb);
+            const span = document.createElement('span'); span.textContent = p.name || '(unnamed)';
+            label.appendChild(span);
+            listWrap.appendChild(label);
+          });
+          panel.appendChild(listWrap);
+
+          const btnRow = document.createElement('div'); btnRow.style.marginTop = '8px'; btnRow.style.display = 'flex'; btnRow.style.gap = '8px'; btnRow.style.flexWrap = 'wrap';
+          const allBtn = document.createElement('button'); allBtn.className = 'ghost icon'; allBtn.textContent = 'Select all';
+          allBtn.addEventListener('click', () => { peopleWithWork.forEach(p => printSelectedPeople.add(p.id)); renderJobCardsLivePage(); });
+          btnRow.appendChild(allBtn);
+          const noneBtn = document.createElement('button'); noneBtn.className = 'ghost icon'; noneBtn.textContent = 'Select none';
+          noneBtn.addEventListener('click', () => { printSelectedPeople.clear(); renderJobCardsLivePage(); });
+          btnRow.appendChild(noneBtn);
+          const goBtn = document.createElement('button'); goBtn.className = 'btn-lg ghost';
+          goBtn.textContent = '🖨 Print selected';
+          goBtn.addEventListener('click', () => {
+            const chosen = peopleWithWork.filter(p => printSelectedPeople.has(p.id));
+            if (!chosen.length){ alert('Pick at least one employee to print.'); return; }
+            printAllJobCards(jobCardsView.date, chosen);
+          });
+          btnRow.appendChild(goBtn);
+          panel.appendChild(btnRow);
+        }
+        const closeBtn = document.createElement('button'); closeBtn.className = 'ghost'; closeBtn.style.marginTop = '8px';
+        closeBtn.textContent = 'Close';
+        closeBtn.addEventListener('click', () => { printSelectExpanded = false; renderJobCardsLivePage(); });
+        panel.appendChild(closeBtn);
+        printWrap.appendChild(panel);
+      } else {
+        const printAllBtn = document.createElement('button'); printAllBtn.className = 'ghost icon';
+        printAllBtn.textContent = '🖨 Print cards for this date…';
+        printAllBtn.addEventListener('click', () => {
+          if (!peopleWithWork.length){ alert('Nothing to print — no one has work on this date yet.'); return; }
+          printSelectedPeople = new Set(peopleWithWork.map(p => p.id)); // everyone pre-selected — one click still prints all
+          printSelectExpanded = true;
+          renderJobCardsLivePage();
+        });
+        printWrap.appendChild(printAllBtn);
+      }
+      listPanel.appendChild(printWrap);
     }
 
     if (!state.people.length){
