@@ -4377,13 +4377,14 @@
   // starting fresh from "today", so a finished sub-task's old window position could get re-offered, along with
   // its hours getting re-counted, days after it was actually done).
   //
-  // A manually excluded sub-task (someone else is doing it, or this build's variant doesn't need it) is taken
-  // off the same way, for the same reason: it isn't real work for THIS person on ANY day, so it shouldn't keep
-  // reserving a slot on their timeline either. It used to still advance the cursor even while hidden, which
-  // meant a handful of legitimately-excluded sub-tasks could quietly eat hours' worth of window space, leaving
-  // the day under-filled with real (visible) work even though the plan hours were never in doubt. Both filters
-  // apply globally (not per-date) so every day's call sees the identical, already-compacted list — otherwise a
-  // sub-task compacted into view on one day could also still be sitting in its old spot on another.
+  // A manually excluded sub-task is deliberately NOT taken off the timeline the way completed ones are — it
+  // still advances the cursor, just hidden from the result. Unticking a sub-task is the user choosing to
+  // underschedule this specific day (someone else is doing it, or it's not needed), not asking for something
+  // else to automatically backfill the gap; if excluded sub-tasks compacted the timeline too, unticking one
+  // would silently pull a *different* sub-task into view to replace it, which is exactly the "unselecting a
+  // task automatically adds other tasks" behavior that got reverted here. Reserving (rather than freeing) its
+  // slot means the day's total simply drops by that sub-task's hours, same as ticking "extra" is the only way
+  // to deliberately add more.
   //
   // windowEnd deliberately reaches CHECKLIST_OVERSCHEDULE_FACTOR times past the day's own planned hours (see
   // its own comment) — pulling ahead into what would otherwise be a later day's slice. That's harmless and
@@ -4392,7 +4393,7 @@
   function checklistForCard(jrTask, assignment, buildId, taskId, hours, date){
     const excluded = new Set(assignment ? assignment.excludedSubtasks : []);
     const extra = new Set((assignment && assignment.extraSubtasksByDate && assignment.extraSubtasksByDate[date]) || []);
-    const allSelected = (jrTask ? jrTask.subtasks : []).filter(st => st.selected && !st.completed && !excluded.has(st.id));
+    const allSelected = (jrTask ? jrTask.subtasks : []).filter(st => st.selected && !st.completed);
     const windowStart = date ? hoursBeforeDate(buildId, taskId, date) : 0;
     const windowEnd = windowStart + (Number(hours) || 0) * CHECKLIST_OVERSCHEDULE_FACTOR;
     let cursor = 0;
@@ -4400,6 +4401,7 @@
     allSelected.forEach(st => {
       const start = cursor;
       cursor += Number(st.standardTime) || 0;
+      if (excluded.has(st.id)) return;
       if (extra.has(st.id)){ result.push(st); return; }
       if (start < windowEnd && cursor > windowStart) result.push(st);
     });
