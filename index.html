@@ -1392,6 +1392,7 @@
       if (jr.machineType === undefined) jr.machineType = '';
       if (jr.leadDays === undefined) jr.leadDays = 0;
       if (jr.buildSheetLeadDays === undefined) jr.buildSheetLeadDays = 0;
+      if (jr.archived === undefined) jr.archived = false;
       if (jr.sourceTemplateId === undefined) jr.sourceTemplateId = null;
       if (!Array.isArray(jr.tasks)) jr.tasks = [];
       normalizeTaskList(jr.tasks);
@@ -1579,6 +1580,7 @@
   // level: 'main' (Jobs + Templates sections) or 'tasks' (drilled into one job's or one template's tasks).
   // mode distinguishes which collection recordId refers to when level is 'tasks': 'job' or 'template'.
   let jobsView = { level: 'main', mode: null, recordId: null, expandedTaskId: null };
+  let jobsShowArchived = false;
   let optionsExpanded = new Set();
   let optionsAppliedExpanded = new Set();
   let optionsAppliedTaskExpanded = new Set(); // keyed `${optionId}|${taskId}`
@@ -8280,16 +8282,35 @@
   function renderJobsMainView(container){
     // ---- Jobs section ----
     const jobsPanel = document.createElement('div'); jobsPanel.className = 'panel';
-    jobsPanel.innerHTML = '<h2>Jobs</h2><div class="hint">Jobs created from a template below. Once created, a job\'s tasks are its own copy — editing the template afterward does not change jobs already made from it.</div>';
+    jobsPanel.innerHTML = '<h2>Jobs</h2><div class="hint">Jobs created from a template below. Once created, a job\'s tasks are its own copy — editing the template afterward does not change jobs already made from it. Archive a job once it\'s done to get it out of this list — its build, sign-off history, reports and time cards all stay exactly as they are; only Remove is destructive.</div>';
+
+    const activeRecords = state.jobRecords.filter(jr => !jr.archived);
+    const archivedRecords = state.jobRecords.filter(jr => jr.archived);
+
+    if (archivedRecords.length){
+      const toggleRow = document.createElement('div'); toggleRow.style.marginTop = '6px';
+      const toggleBtn = document.createElement('button'); toggleBtn.className = 'ghost icon';
+      toggleBtn.textContent = (jobsShowArchived ? '▾' : '▸') + ` Archived jobs (${archivedRecords.length})`;
+      toggleBtn.addEventListener('click', () => { jobsShowArchived = !jobsShowArchived; renderJobsPage(); });
+      toggleRow.appendChild(toggleBtn);
+      jobsPanel.appendChild(toggleRow);
+    }
 
     if (state.jobRecords.length === 0){
       const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
       empty.textContent = 'No jobs yet — add one below.';
       jobsPanel.appendChild(empty);
     } else {
+      const recordsToShow = jobsShowArchived ? state.jobRecords : activeRecords;
+      if (recordsToShow.length === 0){
+        const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
+        empty.textContent = 'Every job is archived — expand "Archived jobs" above to see them.';
+        jobsPanel.appendChild(empty);
+      }
       const list = document.createElement('div'); list.className = 'drill-list'; list.style.marginTop = '10px';
-      state.jobRecords.forEach(jr => {
+      recordsToShow.forEach(jr => {
         const row = document.createElement('div'); row.className = 'drill-row';
+        if (jr.archived) row.style.opacity = '0.6';
         const taskCount = jr.tasks.length;
 
         const handle = document.createElement('span'); handle.className = 'drag-handle'; handle.textContent = '⠿';
@@ -8362,11 +8383,24 @@
         row.appendChild(main);
 
         const meta = document.createElement('div'); meta.className = 'drill-meta';
-        meta.textContent = `${taskCount} task${taskCount === 1 ? '' : 's'} · ${jobEntityTotalHours(jr)}h ›`;
+        meta.textContent = `${taskCount} task${taskCount === 1 ? '' : 's'} · ${jobEntityTotalHours(jr)}h${jr.archived ? ' · archived' : ''} ›`;
         row.appendChild(meta);
 
+        // Non-destructive: just gets it out of the active Jobs list. The build, sign-off history, reports, and
+        // every time card stay exactly as they are — nothing downstream (Archive tab, Reports, Financial
+        // Reports, Job History) is touched, since none of those look at jr.archived at all.
+        const archiveBtn = document.createElement('button'); archiveBtn.className = 'ghost icon';
+        archiveBtn.textContent = jr.archived ? '↩ Unarchive' : '📦 Archive';
+        archiveBtn.title = jr.archived ? 'Bring this job back into the active list.' : 'Get this job out of the active list — nothing else about it changes.';
+        archiveBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          jr.archived = !jr.archived;
+          save(); renderJobsPage();
+        });
+        row.appendChild(archiveBtn);
+
         const delBtn = document.createElement('button'); delBtn.className = 'icon ghost'; delBtn.textContent = '✕';
-        delBtn.title = 'Remove job';
+        delBtn.title = 'Remove job — permanently deletes it, its build, and all its time cards. Use Archive instead if you just want it out of the way.';
         delBtn.addEventListener('click', (e) => {
           e.stopPropagation();
           const affectedBuilds = state.builds.filter(b => b.jobRecordId === jr.id);
