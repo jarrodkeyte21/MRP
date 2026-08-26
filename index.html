@@ -1394,7 +1394,6 @@
       if (jr.machineType === undefined) jr.machineType = '';
       if (jr.leadDays === undefined) jr.leadDays = 0;
       if (jr.buildSheetLeadDays === undefined) jr.buildSheetLeadDays = 0;
-      if (jr.archived === undefined) jr.archived = false;
       if (jr.sourceTemplateId === undefined) jr.sourceTemplateId = null;
       if (!Array.isArray(jr.tasks)) jr.tasks = [];
       normalizeTaskList(jr.tasks);
@@ -1582,7 +1581,7 @@
   // level: 'main' (Jobs + Templates sections) or 'tasks' (drilled into one job's or one template's tasks).
   // mode distinguishes which collection recordId refers to when level is 'tasks': 'job' or 'template'.
   let jobsView = { level: 'main', mode: null, recordId: null, expandedTaskId: null };
-  let jobsShowArchived = false;
+  let jobsShowCompleted = false;
   let optionsExpanded = new Set();
   let optionsAppliedExpanded = new Set();
   let optionsAppliedTaskExpanded = new Set(); // keyed `${optionId}|${taskId}`
@@ -3350,25 +3349,25 @@
 
     const panel = document.createElement('div');
     panel.className = 'panel';
-    panel.innerHTML = '<h2>Job history</h2><div class="hint">Every job marked Complete, grouped by the month it finished (or was marked complete) — including jobs removed from the active Build summary. Jobs still in progress stay on the Schedule &amp; Builds page until they\'re done.</div>';
+    panel.innerHTML = '<h2>Job history</h2><div class="hint">Every job marked Complete, grouped by the month it finished (or was marked complete) — including jobs removed from the active Build summary. Jobs still in progress stay on the Schedule &amp; Builds page until they\'re done. Reactivate one if rework or an update means it needs to come back onto the active schedule.</div>';
     const table = document.createElement('table');
     table.className = 'build-summary';
     table.style.marginTop = '10px';
     table.innerHTML = `<thead><tr>
-      <th>Job #</th><th>Dealer</th><th>Customer</th><th>Machine type</th><th title="When the build sheet needs to be released to stay on track for the earliest start date">Build sheet release</th><th>Order date</th><th>Start</th><th>Dispatch</th><th>Working days</th><th title="Hours used / hours remaining / % complete">Progress</th><th title="Every hour actually logged on the check sheet for this job — can run higher than scheduled if a task took longer than planned">Actual hours used</th><th>Date completed</th>
+      <th>Job #</th><th>Dealer</th><th>Customer</th><th>Machine type</th><th title="When the build sheet needs to be released to stay on track for the earliest start date">Build sheet release</th><th>Order date</th><th>Start</th><th>Dispatch</th><th>Working days</th><th title="Hours used / hours remaining / % complete">Progress</th><th title="Every hour actually logged on the check sheet for this job — can run higher than scheduled if a task took longer than planned">Actual hours used</th><th>Date completed</th><th></th>
     </tr></thead>`;
     const tbody = document.createElement('tbody');
 
     if (completedBuilds.length === 0){
       const tr = document.createElement('tr');
-      const td = document.createElement('td'); td.colSpan = 12; td.style.padding = '12px';
+      const td = document.createElement('td'); td.colSpan = 13; td.style.padding = '12px';
       td.textContent = 'No completed jobs yet.';
       tr.appendChild(td); tbody.appendChild(tr);
     }
 
     groupBuildsByMonth(completedBuilds).forEach(group => {
       const headerRow = document.createElement('tr'); headerRow.className = 'section-row';
-      const headerTd = document.createElement('td'); headerTd.colSpan = 12;
+      const headerTd = document.createElement('td'); headerTd.colSpan = 13;
       headerTd.textContent = group.label;
       headerRow.appendChild(headerTd);
       tbody.appendChild(headerRow);
@@ -3377,6 +3376,19 @@
         const tr = document.createElement('tr');
         tr.innerHTML = buildStatsCellsHtml(b)
           + `<td class="num">${b.completedDate ? fmtShort(parseISO(b.completedDate)) : '—'}</td>`;
+        const tdReactivate = document.createElement('td');
+        const reactivateBtn = document.createElement('button'); reactivateBtn.className = 'icon ghost';
+        reactivateBtn.textContent = '↩ Reactivate';
+        reactivateBtn.title = 'Put this job back on the active schedule — e.g. rework or an update means there\'s more to do.';
+        reactivateBtn.addEventListener('click', () => {
+          const rawBuild = state.builds.find(x => x.id === b.id);
+          if (!rawBuild) return;
+          rawBuild.status = 'scheduled';
+          rawBuild.completedDate = null;
+          save(); renderJobHistory(); renderResults();
+        });
+        tdReactivate.appendChild(reactivateBtn);
+        tr.appendChild(tdReactivate);
         tbody.appendChild(tr);
       });
     });
@@ -8286,16 +8298,23 @@
   function renderJobsMainView(container){
     // ---- Jobs section ----
     const jobsPanel = document.createElement('div'); jobsPanel.className = 'panel';
-    jobsPanel.innerHTML = '<h2>Jobs</h2><div class="hint">Jobs created from a template below. Once created, a job\'s tasks are its own copy — editing the template afterward does not change jobs already made from it. Archive a job once it\'s done to get it out of this list — its build, sign-off history, reports and time cards all stay exactly as they are; only Remove is destructive.</div>';
+    jobsPanel.innerHTML = '<h2>Jobs</h2><div class="hint">Jobs created from a template below. Once created, a job\'s tasks are its own copy — editing the template afterward does not change jobs already made from it. Tick a job Complete once it\'s done to get it out of this list and send it to Job History — its build, sign-off history, reports and time cards all stay exactly as they are; only Remove is destructive.</div>';
 
-    const activeRecords = state.jobRecords.filter(jr => !jr.archived);
-    const archivedRecords = state.jobRecords.filter(jr => jr.archived);
+    // "Complete" here is the same build.status the Schedule & Builds status dropdown and Job History both
+    // already use — ticking Complete here is exactly equivalent to picking "Complete" there, just reachable
+    // from the Jobs tab. A job with no linked build (shouldn't normally happen — syncBuildsFromJobs keeps them
+    // in sync) is treated as not-complete since there's no status to check.
+    function linkedBuildFor(jr){ return state.builds.find(b => b.jobRecordId === jr.id); }
+    function isJobComplete(jr){ const b = linkedBuildFor(jr); return !!b && b.status === 'complete'; }
 
-    if (archivedRecords.length){
+    const activeRecords = state.jobRecords.filter(jr => !isJobComplete(jr));
+    const completedRecords = state.jobRecords.filter(jr => isJobComplete(jr));
+
+    if (completedRecords.length){
       const toggleRow = document.createElement('div'); toggleRow.style.marginTop = '6px';
       const toggleBtn = document.createElement('button'); toggleBtn.className = 'ghost icon';
-      toggleBtn.textContent = (jobsShowArchived ? '▾' : '▸') + ` Archived jobs (${archivedRecords.length})`;
-      toggleBtn.addEventListener('click', () => { jobsShowArchived = !jobsShowArchived; renderJobsPage(); });
+      toggleBtn.textContent = (jobsShowCompleted ? '▾' : '▸') + ` Completed jobs (${completedRecords.length}) — also in Job History`;
+      toggleBtn.addEventListener('click', () => { jobsShowCompleted = !jobsShowCompleted; renderJobsPage(); });
       toggleRow.appendChild(toggleBtn);
       jobsPanel.appendChild(toggleRow);
     }
@@ -8305,16 +8324,17 @@
       empty.textContent = 'No jobs yet — add one below.';
       jobsPanel.appendChild(empty);
     } else {
-      const recordsToShow = jobsShowArchived ? state.jobRecords : activeRecords;
+      const recordsToShow = jobsShowCompleted ? state.jobRecords : activeRecords;
       if (recordsToShow.length === 0){
         const empty = document.createElement('div'); empty.className = 'dep-empty'; empty.style.marginTop = '10px';
-        empty.textContent = 'Every job is archived — expand "Archived jobs" above to see them.';
+        empty.textContent = 'Every job is complete — expand "Completed jobs" above to see them, or find them in Job History.';
         jobsPanel.appendChild(empty);
       }
       const list = document.createElement('div'); list.className = 'drill-list'; list.style.marginTop = '10px';
       recordsToShow.forEach(jr => {
         const row = document.createElement('div'); row.className = 'drill-row';
-        if (jr.archived) row.style.opacity = '0.6';
+        const jrComplete = isJobComplete(jr);
+        if (jrComplete) row.style.opacity = '0.6';
         const taskCount = jr.tasks.length;
 
         const handle = document.createElement('span'); handle.className = 'drag-handle'; handle.textContent = '⠿';
@@ -8387,21 +8407,32 @@
         row.appendChild(main);
 
         const meta = document.createElement('div'); meta.className = 'drill-meta';
-        meta.textContent = `${taskCount} task${taskCount === 1 ? '' : 's'} · ${jobEntityTotalHours(jr)}h${jr.archived ? ' · archived' : ''} ›`;
+        meta.textContent = `${taskCount} task${taskCount === 1 ? '' : 's'} · ${jobEntityTotalHours(jr)}h${jrComplete ? ' · complete' : ''} ›`;
         row.appendChild(meta);
 
-        // Non-destructive: just gets it out of the active Jobs list. The build, sign-off history, reports, and
-        // every time card stay exactly as they are — nothing downstream (Archive tab, Reports, Financial
-        // Reports, Job History) is touched, since none of those look at jr.archived at all.
-        const archiveBtn = document.createElement('button'); archiveBtn.className = 'ghost icon';
-        archiveBtn.textContent = jr.archived ? '↩ Unarchive' : '📦 Archive';
-        archiveBtn.title = jr.archived ? 'Bring this job back into the active list.' : 'Get this job out of the active list — nothing else about it changes.';
-        archiveBtn.addEventListener('click', (e) => {
+        // Sets the linked build's status the exact same way the Schedule & Builds status dropdown does —
+        // ticking Complete here IS marking that build Complete, so it's automatically picked up by Job History
+        // (which lists every build with status 'complete') without anything extra to keep in sync. Non-
+        // destructive either way: the build, sign-off history, reports, and every time card are untouched.
+        const linkedBuild = linkedBuildFor(jr);
+        const completeBtn = document.createElement('button'); completeBtn.className = 'ghost icon';
+        completeBtn.textContent = jrComplete ? '↩ Reopen' : '✓ Complete';
+        completeBtn.title = jrComplete ? 'Reopen this job — puts its build back to Scheduled.' : 'Mark this job complete — sends its build to Job History and gets it out of this list.';
+        completeBtn.disabled = !linkedBuild;
+        if (!linkedBuild) completeBtn.title = 'No build is linked to this job yet — nothing to mark complete.';
+        completeBtn.addEventListener('click', (e) => {
           e.stopPropagation();
-          jr.archived = !jr.archived;
-          save(); renderJobsPage();
+          if (!linkedBuild) return;
+          if (jrComplete){
+            linkedBuild.status = 'scheduled';
+            linkedBuild.completedDate = null;
+          } else {
+            linkedBuild.status = 'complete';
+            linkedBuild.completedDate = getTodayISO();
+          }
+          save(); renderJobsPage(); renderResults();
         });
-        row.appendChild(archiveBtn);
+        row.appendChild(completeBtn);
 
         const delBtn = document.createElement('button'); delBtn.className = 'icon ghost'; delBtn.textContent = '✕';
         delBtn.title = 'Remove job — permanently deletes it, its build, and all its time cards. Use Archive instead if you just want it out of the way.';
