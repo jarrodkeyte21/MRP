@@ -5050,9 +5050,12 @@
       if (opts.pulled || (cb && cb.checked)){
         const raw = state.builds.find(b => b.id === c.buildId);
         const jrTask = jobCardSourceTask(raw, c.taskId);
-        // Already-completed sub-tasks don't need (re-)assigning — this is the planning checklist, not the
-        // employee's own day-of card, so a finished sub-task just has nothing left to tick here.
-        const selectedSubtasks = jrTask ? jrTask.subtasks.filter(st => st.selected && !st.completed) : [];
+        // NOT filtered by completed — this list has to match exactly what checklistForCard's own cursor walks
+        // (it doesn't skip completed sub-tasks either, see its comment), since `budgeted` below is compared
+        // against these same ids. Hiding a completed one here without also changing the cursor left its window
+        // slot silently claimed by nothing, pushing the next real (incomplete) sub-task into "extra" and
+        // breaking the day's automatic hour-fill — a regression, reverted.
+        const selectedSubtasks = jrTask ? jrTask.subtasks.filter(st => st.selected) : [];
         if (selectedSubtasks.length){
           const assignment = raw.taskAssignments[c.taskId];
           const excluded = new Set(assignment.excludedSubtasks || []);
