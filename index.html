@@ -606,7 +606,7 @@
 
   function duplicateJobTemplate(jtm){
     state.jobTemplates.push({
-      id: uid('jtm'), name: (jtm.name || 'Untitled') + ' (copy)', leadDays: jtm.leadDays ?? 0, tasks: deepCloneJobTasks(jtm.tasks)
+      id: uid('jtm'), name: (jtm.name || 'Untitled') + ' (copy)', leadDays: jtm.leadDays ?? 0, buildSheetLeadDays: jtm.buildSheetLeadDays ?? 0, tasks: deepCloneJobTasks(jtm.tasks)
     });
     save(); renderJobsPage();
   }
@@ -630,7 +630,7 @@
   function duplicateJobRecord(jr){
     state.jobRecords.push({
       id: uid('jr'), jobNumber: uniqueJobNumberFor(jr.jobNumber), dealer: jr.dealer, customer: jr.customer,
-      machineType: jr.machineType, leadDays: jr.leadDays ?? 0, sourceTemplateId: jr.sourceTemplateId, tasks: deepCloneJobTasks(jr.tasks)
+      machineType: jr.machineType, leadDays: jr.leadDays ?? 0, buildSheetLeadDays: jr.buildSheetLeadDays ?? 0, sourceTemplateId: jr.sourceTemplateId, tasks: deepCloneJobTasks(jr.tasks)
     });
     syncBuildsFromJobs();
     save(); renderJobsPage(); renderResults();
@@ -800,7 +800,9 @@
         hours[t.id] = (ov !== undefined && ov !== null) ? ov : (tmpl.hours[t.id] ?? 0);
       });
       const leadDays = (b.leadOverride !== undefined && b.leadOverride !== null) ? b.leadOverride : (tmpl.leadDays ?? 0);
-      return { template: tmpl, jobRecord: null, sourceName: tmpl.name, hours, dependsOn: tmpl.dependsOn, maxPerDay: tmpl.maxPerDay, machineType: tmpl.name, leadDays, jobNumber: b.jobNumber, dealer: b.dealer, customer: b.customer };
+      // The legacy flat-template path has no Jobs-tab equivalent of its own, so a build sheet lead is always 0
+      // here — buildSheetLeadDays only ever comes from a Jobs-tab template or job record.
+      return { template: tmpl, jobRecord: null, sourceName: tmpl.name, hours, dependsOn: tmpl.dependsOn, maxPerDay: tmpl.maxPerDay, machineType: tmpl.name, leadDays, buildSheetLeadDays: 0, jobNumber: b.jobNumber, dealer: b.dealer, customer: b.customer };
     }
     const jr = b.jobRecordId ? state.jobRecords.find(x => x.id === b.jobRecordId) : null;
     if (jr){
@@ -812,18 +814,32 @@
         hours[t.id] = (ov !== undefined && ov !== null) ? ov : (maps.hours[t.id] ?? 0);
       });
       const leadDays = (b.leadOverride !== undefined && b.leadOverride !== null) ? b.leadOverride : (jr.leadDays ?? 0);
+      const buildSheetLeadDays = jr.buildSheetLeadDays ?? 0;
       // Identity fields (Job #, Dealer, Customer) stay live off the job record too, same as Machine type —
       // renaming the job in the Jobs tab should follow through to any build it's applied to.
-      return { template: null, jobRecord: jr, sourceName: jr.jobNumber || '(unnamed job)', hours, dependsOn: maps.dependsOn, maxPerDay: maps.maxPerDay, machineType: jr.machineType, leadDays, jobNumber: jr.jobNumber, dealer: jr.dealer, customer: jr.customer };
+      return { template: null, jobRecord: jr, sourceName: jr.jobNumber || '(unnamed job)', hours, dependsOn: maps.dependsOn, maxPerDay: maps.maxPerDay, machineType: jr.machineType, leadDays, buildSheetLeadDays, jobNumber: jr.jobNumber, dealer: jr.dealer, customer: jr.customer };
     }
-    return { template: null, jobRecord: null, sourceName: null, hours: b.hours || {}, dependsOn: b.dependsOn || {}, maxPerDay: b.maxPerDay || {}, machineType: b.machineType, leadDays: b.leadDays ?? 0, jobNumber: b.jobNumber, dealer: b.dealer, customer: b.customer };
+    return { template: null, jobRecord: null, sourceName: null, hours: b.hours || {}, dependsOn: b.dependsOn || {}, maxPerDay: b.maxPerDay || {}, machineType: b.machineType, leadDays: b.leadDays ?? 0, buildSheetLeadDays: b.buildSheetLeadDays ?? 0, jobNumber: b.jobNumber, dealer: b.dealer, customer: b.customer };
   }
 
-  // ---------- earliest a build can start: order date + lead time (days) for materials to arrive. Null if no order date set (unconstrained). Lead time tracks the linked template unless unlinked. ----------
+  // ---------- earliest a build can start: order date + purchasing lead time (days) for materials to arrive.
+  // Null if no order date set (unconstrained). Lead time tracks the linked template/job unless overridden. The
+  // build sheet's own lead time (see buildSheetReleaseDate) runs BEFORE order date, not after, so it doesn't
+  // extend this. ----------
   function earliestStart(b){
     if (!b.orderDate) return null;
     const days = Number(effectiveBuildData(b).leadDays) || 0;
     return toISO(addDays(parseISO(b.orderDate), days));
+  }
+
+  // ---------- when the build sheet needs to be released: working days BACKWARD from order date (drafting has
+  // to be done, and materials known, before a purchase order can even be placed) — not forward like the
+  // purchasing lead time in earliestStart. Counts working days only (Mon-Fri), unlike the calendar-day math
+  // elsewhere, since drafting is office work that doesn't happen on weekends. Null if no order date set. ----------
+  function buildSheetReleaseDate(b){
+    if (!b.orderDate) return null;
+    const days = Number(effectiveBuildData(b).buildSheetLeadDays) || 0;
+    return toISO(addWorkingDays(parseISO(b.orderDate), -days));
   }
 
   // ---------- suggest an order date: run the schedule as if this build had no hold, see when capacity/priority alone would let it start, then work backward by its lead time ----------
@@ -1294,6 +1310,7 @@
       if (b.notes === undefined) b.notes = '';
       if (b.orderDate === undefined) b.orderDate = '';
       if (b.leadDays === undefined) b.leadDays = 0;
+      if (b.buildSheetLeadDays === undefined) b.buildSheetLeadDays = 0;
       if (b.orderDateAuto === undefined) b.orderDateAuto = false;
       if (b.status === undefined){
         b.status = b.orderPlaced ? 'ordered' : 'scheduled';
@@ -1362,6 +1379,7 @@
       if (!jtm.id) jtm.id = uid('jtm');
       if (jtm.name === undefined) jtm.name = '';
       if (jtm.leadDays === undefined) jtm.leadDays = 0;
+      if (jtm.buildSheetLeadDays === undefined) jtm.buildSheetLeadDays = 0;
       if (!Array.isArray(jtm.tasks)) jtm.tasks = [];
       normalizeTaskList(jtm.tasks);
     });
@@ -1373,6 +1391,7 @@
       if (jr.customer === undefined) jr.customer = '';
       if (jr.machineType === undefined) jr.machineType = '';
       if (jr.leadDays === undefined) jr.leadDays = 0;
+      if (jr.buildSheetLeadDays === undefined) jr.buildSheetLeadDays = 0;
       if (jr.sourceTemplateId === undefined) jr.sourceTemplateId = null;
       if (!Array.isArray(jr.tasks)) jr.tasks = [];
       normalizeTaskList(jr.tasks);
@@ -1571,6 +1590,20 @@
   function parseISO(s){ const [y,m,d] = s.split('-').map(Number); return new Date(y, m-1, d); }
   function toISO(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
   function addDays(d,n){ const r = new Date(d); r.setDate(r.getDate()+n); return r; }
+  // Same as addDays but counts only Mon-Fri — weekends are skipped rather than counted toward n. Works
+  // backward for a negative n (skipping weekends the same way). Used for build-sheet lead time, which is
+  // drafting/office work that doesn't happen on weekends, unlike addDays' general-purpose calendar-day math.
+  function addWorkingDays(d, n){
+    const r = new Date(d);
+    let remaining = Math.abs(n);
+    const step = n < 0 ? -1 : 1;
+    while (remaining > 0){
+      r.setDate(r.getDate() + step);
+      const dow = r.getDay();
+      if (dow !== 0 && dow !== 6) remaining--;
+    }
+    return r;
+  }
   function fmtShort(d){ return DOW_NAMES[d.getDay()] + ' ' + d.getDate() + '/' + (d.getMonth()+1); }
   function fmtDateLong(dateISO){ const d = parseISO(dateISO); return d.getDate() + ' ' + ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getMonth()] + ' ' + d.getFullYear(); }
   function mondayOfDate(d){ const dow = d.getDay(); const diff = (dow === 0) ? -6 : (1 - dow); return addDays(d, diff); }
@@ -1826,6 +1859,7 @@
       <td>${b.customer || '—'}</td>
       <td>${b.machineType || '—'}</td>
       <td class="num">${b.orderDate ? fmtShort(parseISO(b.orderDate)) : '—'}</td>
+      <td class="num">${b.buildSheetReleaseDate ? fmtShort(parseISO(b.buildSheetReleaseDate)) : '—'}</td>
       <td class="num">${b.startDate ? fmtShort(parseISO(b.startDate)) : '—'}</td>
       <td class="num">${dispatchDate ? fmtShort(parseISO(dispatchDate)) : '—'}</td>
       <td class="num">${workDaySpan}</td>
@@ -1964,6 +1998,7 @@
         id: b.id, customer: eff.customer, dealer: eff.dealer || '', machineType: eff.machineType, jobNumber: eff.jobNumber,
         orderDate: b.orderDate || null, status: b.status || 'scheduled', archived: !!b.archived, completedDate: b.completedDate || null,
         earliestStartDate: (b.id === ignoreHoldFor) ? null : earliestStart(b),
+        buildSheetReleaseDate: (b.id === ignoreHoldFor) ? null : buildSheetReleaseDate(b),
         dependsOn: eff.dependsOn || {}, tstates, startDate: null, finishDate: null, allocations: [],
         tasksWorkedToday: new Set(),
         get done(){ return this.tstates.every(t => t.done); }
@@ -3069,14 +3104,14 @@
     const sumTable = document.createElement('table');
     sumTable.className = 'build-summary';
     sumTable.innerHTML = `<thead><tr>
-      <th>Job #</th><th>Dealer</th><th>Customer</th><th>Machine type</th><th>Order date</th><th>Start</th><th>Dispatch</th><th>Working days</th><th title="Hours used / hours remaining / % complete">Progress</th><th title="Every hour actually logged on the check sheet for this job — can run higher than scheduled if a task took longer than planned">Actual hours used</th><th>Status</th><th></th>
+      <th>Job #</th><th>Dealer</th><th>Customer</th><th>Machine type</th><th>Order date</th><th title="When the build sheet needs to be released to stay on track for the earliest start date">Build sheet release</th><th>Start</th><th>Dispatch</th><th>Working days</th><th title="Hours used / hours remaining / % complete">Progress</th><th title="Every hour actually logged on the check sheet for this job — can run higher than scheduled if a task took longer than planned">Actual hours used</th><th>Status</th><th></th>
     </tr></thead>`;
     const sumBody = document.createElement('tbody');
 
     const summaryBuilds = builds.filter(b => !b.archived);
     groupBuildsByMonth(summaryBuilds).forEach(group => {
       const headerRow = document.createElement('tr'); headerRow.className = 'section-row';
-      const headerTd = document.createElement('td'); headerTd.colSpan = 12;
+      const headerTd = document.createElement('td'); headerTd.colSpan = 13;
       headerTd.textContent = group.label;
       headerRow.appendChild(headerTd);
       sumBody.appendChild(headerRow);
@@ -3314,20 +3349,20 @@
     table.className = 'build-summary';
     table.style.marginTop = '10px';
     table.innerHTML = `<thead><tr>
-      <th>Job #</th><th>Dealer</th><th>Customer</th><th>Machine type</th><th>Order date</th><th>Start</th><th>Dispatch</th><th>Working days</th><th title="Hours used / hours remaining / % complete">Progress</th><th title="Every hour actually logged on the check sheet for this job — can run higher than scheduled if a task took longer than planned">Actual hours used</th><th>Date completed</th>
+      <th>Job #</th><th>Dealer</th><th>Customer</th><th>Machine type</th><th>Order date</th><th title="When the build sheet needs to be released to stay on track for the earliest start date">Build sheet release</th><th>Start</th><th>Dispatch</th><th>Working days</th><th title="Hours used / hours remaining / % complete">Progress</th><th title="Every hour actually logged on the check sheet for this job — can run higher than scheduled if a task took longer than planned">Actual hours used</th><th>Date completed</th>
     </tr></thead>`;
     const tbody = document.createElement('tbody');
 
     if (completedBuilds.length === 0){
       const tr = document.createElement('tr');
-      const td = document.createElement('td'); td.colSpan = 11; td.style.padding = '12px';
+      const td = document.createElement('td'); td.colSpan = 12; td.style.padding = '12px';
       td.textContent = 'No completed jobs yet.';
       tr.appendChild(td); tbody.appendChild(tr);
     }
 
     groupBuildsByMonth(completedBuilds).forEach(group => {
       const headerRow = document.createElement('tr'); headerRow.className = 'section-row';
-      const headerTd = document.createElement('td'); headerTd.colSpan = 11;
+      const headerTd = document.createElement('td'); headerTd.colSpan = 12;
       headerTd.textContent = group.label;
       headerRow.appendChild(headerTd);
       tbody.appendChild(headerRow);
@@ -3373,13 +3408,13 @@
     table.className = 'build-summary';
     table.style.marginTop = '10px';
     table.innerHTML = `<thead><tr>
-      <th>Job #</th><th>Dealer</th><th>Customer</th><th>Machine type</th><th>Order date</th><th>Start</th><th>Dispatch</th><th>Working days</th><th title="Hours used / hours remaining / % complete">Progress</th><th title="Every hour actually logged on the check sheet for this job — can run higher than scheduled if a task took longer than planned">Actual hours used</th><th>Date completed</th>
+      <th>Job #</th><th>Dealer</th><th>Customer</th><th>Machine type</th><th>Order date</th><th title="When the build sheet needs to be released to stay on track for the earliest start date">Build sheet release</th><th>Start</th><th>Dispatch</th><th>Working days</th><th title="Hours used / hours remaining / % complete">Progress</th><th title="Every hour actually logged on the check sheet for this job — can run higher than scheduled if a task took longer than planned">Actual hours used</th><th>Date completed</th>
     </tr></thead>`;
     const tbody = document.createElement('tbody');
 
     if (stockBuilds.length === 0){
       const tr = document.createElement('tr');
-      const td = document.createElement('td'); td.colSpan = 11; td.style.padding = '12px';
+      const td = document.createElement('td'); td.colSpan = 12; td.style.padding = '12px';
       td.textContent = 'No wholesale Hansa units right now.';
       tr.appendChild(td); tbody.appendChild(tr);
     }
@@ -8413,7 +8448,7 @@
       }
       state.jobRecords.push({
         id: uid('jr'), jobNumber: jobNumInp.value, dealer: dealerInp.value, customer: custInp.value,
-        machineType: machInp.value || tmpl.name, leadDays: tmpl.leadDays ?? 0,
+        machineType: machInp.value || tmpl.name, leadDays: tmpl.leadDays ?? 0, buildSheetLeadDays: tmpl.buildSheetLeadDays ?? 0,
         sourceTemplateId: tmpl.id, tasks: deepCloneJobTasks(tmpl.tasks)
       });
       syncBuildsFromJobs();
@@ -8794,10 +8829,21 @@
 
     const leadRow = document.createElement('div'); leadRow.className = 'field-row'; leadRow.style.marginTop = '10px';
     const leadLabel = document.createElement('label'); leadLabel.textContent = 'Lead time (days)';
+    leadLabel.title = 'Purchasing lead time — how long materials take to arrive once ordered.';
     leadRow.appendChild(leadLabel);
     const leadInp = makeHourInput(owner.leadDays ?? 0, (val) => { owner.leadDays = Number(val) || 0; save(); });
     leadInp.step = 1;
     leadRow.appendChild(leadInp);
+    // Runs BEFORE order date, not after — the build sheet has to be drafted and released before a purchase
+    // order can even be placed, so the release date is order date MINUS this (working days only, no weekends).
+    // Doesn't extend the purchasing lead time above or the earliest start date; see Schedule & Builds' "Build
+    // sheet release" column for the resulting date.
+    const bsLeadLabel = document.createElement('label'); bsLeadLabel.textContent = 'Build sheet lead time (days)';
+    bsLeadLabel.title = 'How many working days before Order date the build sheet needs to be released.';
+    leadRow.appendChild(bsLeadLabel);
+    const bsLeadInp = makeHourInput(owner.buildSheetLeadDays ?? 0, (val) => { owner.buildSheetLeadDays = Number(val) || 0; save(); });
+    bsLeadInp.step = 1;
+    leadRow.appendChild(bsLeadInp);
     panel.appendChild(leadRow);
 
     if (owner.tasks.length === 0){
