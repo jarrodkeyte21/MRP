@@ -4905,8 +4905,17 @@
       const list = document.createElement('div'); list.className = 'drill-list'; list.style.marginTop = '10px';
       sortedPeople().forEach(p => {
         const row = document.createElement('div'); row.className = 'drill-row';
-        const main = document.createElement('div'); main.className = 'drill-main';
-        main.textContent = (p.name || '(unnamed)') + (isPersonSickOn(p.id, jobCardsView.date) ? ' — sick' : '');
+        const main = document.createElement('div'); main.className = 'drill-main'; main.style.display = 'flex'; main.style.alignItems = 'center'; main.style.gap = '6px';
+        const nameSpan = document.createElement('span');
+        nameSpan.textContent = (p.name || '(unnamed)') + (isPersonSickOn(p.id, jobCardsView.date) ? ' — sick' : '');
+        main.appendChild(nameSpan);
+        // Locked & sent for this date — the manager's done assigning this person's day, so a glance at the
+        // list says so without having to open each one to check.
+        if (isPersonDateLocked(p.id, jobCardsView.date)){
+          const tick = document.createElement('span'); tick.style.color = 'var(--good)'; tick.style.fontWeight = '700';
+          tick.textContent = '✓'; tick.title = `Locked & sent for ${fmtDateLong(jobCardsView.date)}`;
+          main.appendChild(tick);
+        }
         row.appendChild(main);
         const meta = document.createElement('div'); meta.className = 'drill-meta';
         const assignedCards = cards.filter(c => c.assignedPersonId === p.id);
@@ -4951,7 +4960,12 @@
       ? 'Unlock this date so assignments can be changed again.'
       : 'Freeze this date\'s assignments and mark them sent — stands in for actually dispatching to this person\'s (future) account.';
     lockBtn.addEventListener('click', () => {
-      setPersonDateLocked(person.id, date, !locked);
+      const nowLocked = !locked;
+      setPersonDateLocked(person.id, date, nowLocked);
+      // Locking (not unlocking) is the "I'm done assigning this person's day" action — drop straight back to
+      // the Employees list so the manager can see it and move on to the next person, instead of staying stuck
+      // on this one's assign view.
+      if (nowLocked){ jobCardsView.level = 'list'; jobCardsView.assignPersonId = null; }
       renderJobCardsPage();
     });
     heading.appendChild(lockBtn);
