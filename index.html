@@ -4364,30 +4364,24 @@
   // overschedule a day by adding a sub-task beyond that window (assignment.extraSubtasksByDate); those always
   // show regardless.
   //
-  // A sub-task already finished on a DIFFERENT day is taken off the timeline entirely (doesn't advance the
-  // cursor, can't land in any window) rather than merely hidden from the result — the scheduling engine always
-  // re-simulates a task's remaining hours starting fresh from "today" (computeAllocationsByDate never looks
-  // further back than that), so `windowStart` comes back 0 again on a later day even once real work already
-  // happened. Left unhandled, that keeps landing the window back on the very start of the sub-task list,
-  // re-offering something that's genuinely done and re-counting its hours into this day's total. Taking it off
-  // the timeline lets whatever's actually still outstanding compact forward into view instead. A sub-task
-  // finished ON this exact day (it has a timeLog dated `date`) still counts normally — ticking it complete
-  // doesn't make it vanish off the very card it was just worked on.
+  // A completed sub-task is taken off this list entirely, not just hidden for today — it's filtered out before
+  // the cursor walk even starts, so it never occupies a slot on the timeline and can't come back on some later
+  // day's card (which used to happen: the scheduling engine always re-simulates a task's remaining hours
+  // starting fresh from "today", so a finished sub-task's old window position could get re-offered, along with
+  // its hours getting re-counted, days after it was actually done).
   function checklistForCard(jrTask, assignment, buildId, taskId, hours, date){
     const excluded = new Set(assignment ? assignment.excludedSubtasks : []);
     const extra = new Set((assignment && assignment.extraSubtasksByDate && assignment.extraSubtasksByDate[date]) || []);
-    const allSelected = (jrTask ? jrTask.subtasks : []).filter(st => st.selected);
+    const allSelected = (jrTask ? jrTask.subtasks : []).filter(st => st.selected && !st.completed);
     const windowStart = date ? hoursBeforeDate(buildId, taskId, date) : 0;
     const windowEnd = windowStart + (Number(hours) || 0);
     let cursor = 0;
     const result = [];
     allSelected.forEach(st => {
-      if (extra.has(st.id)){ result.push(st); return; }
-      const staleComplete = date && st.completed && !(st.timeLogs || []).some(tl => tl.date === date);
-      if (staleComplete) return; // done on some earlier day — no longer occupies a slot on the timeline
       const start = cursor;
       cursor += Number(st.standardTime) || 0;
       if (excluded.has(st.id)) return;
+      if (extra.has(st.id)){ result.push(st); return; }
       if (start < windowEnd && cursor > windowStart) result.push(st);
     });
     return result;
@@ -5085,21 +5079,29 @@
       if (opts.pulled || (cb && cb.checked)){
         const raw = state.builds.find(b => b.id === c.buildId);
         const jrTask = jobCardSourceTask(raw, c.taskId);
-        // NOT filtered by completed — this list has to match exactly what checklistForCard's own cursor walks
-        // (it doesn't skip completed sub-tasks either, see its comment), since `budgeted` below is compared
-        // against these same ids. Hiding a completed one here without also changing the cursor left its window
-        // slot silently claimed by nothing, pushing the next real (incomplete) sub-task into "extra" and
-        // breaking the day's automatic hour-fill — a regression, reverted.
-        const selectedSubtasks = jrTask ? jrTask.subtasks.filter(st => st.selected) : [];
+        // Filtered by completed the exact same way checklistForCard's own cursor walk is (a completed sub-task
+        // is off the list entirely, not just hidden) — this list has to match it exactly, since `budgeted`
+        // below is compared against these same ids. A mismatch here previously broke the day's automatic
+        // hour-fill (see git history), so any future change to one of these filters must change the other too.
+        const selectedSubtasks = jrTask ? jrTask.subtasks.filter(st => st.selected && !st.completed) : [];
         if (selectedSubtasks.length){
           const assignment = raw.taskAssignments[c.taskId];
-          const excluded = new Set(assignment.excludedSubtasks || []);
           const cardDate = opts.pulled ? c.pulledFromDate : date;
           // Only enough sub-tasks to fill this day's hours are ticked by default (same budget window Job Cards
           // itself uses) — the rest sit unticked so assigning a card doesn't silently claim the whole task's
           // checklist. Ticking one beyond the budget deliberately overschedules it (extraSubtasksByDate),
           // exactly like the "+ Add to this day" control on the card detail view.
-          const budgeted = new Set(checklistForCard(jrTask, assignment, c.buildId, c.taskId, c.hours, cardDate).map(st => st.id));
+          //
+          // Two different sets are needed here, not one: `actuallyIncluded` (the real checklistForCard result,
+          // respecting the current exclusions) drives the checkbox's checked state — the ground truth of
+          // what's really on today's card. `naturalBudget` (the same call with excludedSubtasks cleared) drives
+          // `inBudget`, which decides which field a click writes to. They can't be the same set: if `inBudget`
+          // came from the exclusion-respecting result, unticking a naturally-budgeted sub-task removes it from
+          // that set on the very next render, flipping `inBudget` to false — so re-ticking it would start
+          // writing to extraSubtasksByDate instead of clearing excludedSubtasks, and since checklistForCard
+          // checks excludedSubtasks first, the sub-task could never be brought back at all.
+          const actuallyIncluded = new Set(checklistForCard(jrTask, assignment, c.buildId, c.taskId, c.hours, cardDate).map(st => st.id));
+          const naturalBudget = new Set(checklistForCard(jrTask, { ...assignment, excludedSubtasks: [] }, c.buildId, c.taskId, c.hours, cardDate).map(st => st.id));
           const subWrap = document.createElement('div'); subWrap.className = 'dep-list'; subWrap.style.marginTop = '8px'; subWrap.style.paddingLeft = '26px';
           selectedSubtasks.forEach(st => {
             const subLabel = document.createElement('label'); subLabel.className = 'dep-item';
@@ -5111,9 +5113,9 @@
                 e.dataTransfer.setData('text/plain', JSON.stringify({ kind: 'jobcard-pull', buildId: c.buildId, taskId: c.taskId, subtaskId: st.id, sourceDate: date }));
               });
             }
-            const inBudget = budgeted.has(st.id);
+            const inBudget = naturalBudget.has(st.id);
             const subCb = document.createElement('input'); subCb.type = 'checkbox';
-            subCb.checked = inBudget;
+            subCb.checked = actuallyIncluded.has(st.id);
             subCb.disabled = locked;
             subCb.title = inBudget ? '' : 'Beyond this day\'s hours — ticking it deliberately overschedules the day.';
             subCb.addEventListener('click', (e) => e.stopPropagation());
