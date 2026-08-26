@@ -347,6 +347,31 @@
   #authGate .panel { width: 100%; max-width: 360px; }
   #authGate .field-row { flex-direction: column; align-items: stretch; gap: 4px; }
   #authGate .field-row input { width: 100%; }
+
+  /* ---- Printable job card: a paper fallback when a tablet is down or a new starter has no login yet. Hidden
+     on screen, shown only inside the browser's print/PDF dialog — see printJobCard(). ---- */
+  #printArea { display: none; }
+  .print-card { color: #000; font-family: var(--font-body, sans-serif); }
+  .print-card h1 { font-size: 16px; margin: 0 0 2px; }
+  .print-card .print-sub { font-size: 14px; font-weight: 700; margin-bottom: 2px; }
+  .print-card .print-meta { font-size: 10px; color: #555; margin-bottom: 14px; }
+  .print-section { margin-top: 14px; page-break-inside: avoid; }
+  .print-section h2 { font-size: 13px; margin: 0 0 2px; }
+  .print-section .print-sub2 { font-size: 11px; color: #333; margin-bottom: 4px; }
+  .print-table { width: 100%; border-collapse: collapse; margin-top: 4px; font-size: 11px; }
+  .print-table th, .print-table td { border: 1px solid #999; padding: 4px 6px; text-align: left; vertical-align: top; }
+  .print-table th { background: #eee; }
+  .print-blank { min-width: 70px; }
+  .print-checkbox { width: 30px; text-align: center; }
+  .print-checkbox::after { content: "\2610"; font-size: 14px; }
+  .print-blank-line { font-size: 12px; margin-top: 4px; }
+  .print-footer { margin-top: 26px; font-size: 12px; }
+  .print-page-break { page-break-after: always; }
+  @media print {
+    body * { visibility: hidden; }
+    #printArea, #printArea * { visibility: visible; }
+    #printArea { display: block !important; position: absolute; top: 0; left: 0; width: 100%; margin: 0; padding: 0; }
+  }
 </style>
 
 <div id="authGate" style="display:none">
@@ -497,6 +522,8 @@
 
 <footer class="note">Data syncs live to a shared Supabase project when online, and falls back to this browser's local storage when it can't reach it. Use Export config to back up or share a setup.</footer>
 </div>
+
+<div id="printArea"></div>
 
 <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
 <script>
@@ -6396,6 +6423,171 @@
     realContainer.appendChild(footer);
   }
 
+  // ---------- Printable job card: a paper fallback for when a tablet is broken or a new starter has no login
+  // yet — same data as the live card (scheduled tasks, pulled work, manual adds, ad-hoc entries), laid out as
+  // blank checklists the floor can tick/write on by hand. Nothing here is saved; a manager keys the results
+  // back into Job Cards once whatever knocked the tablet out is sorted. Recomputes its own data from `person`/
+  // `date` rather than taking it as a parameter, so it can be triggered from anywhere without the caller having
+  // to first assemble the same five lookups renderJobCardsLivePage does. ----------
+  function printableJobCardEl(person, date){
+    const allocByDate = computeAllocationsByDate();
+    const sent = isPersonDateLocked(person.id, date);
+    const allCardsToday = buildJobCardsForDate(date, allocByDate);
+    const cards = sent ? allCardsToday.filter(c => isCardForPerson(c, person.id)) : [];
+    const pulledTasks = sent ? pulledTaskCardsForDate(person, date, allocByDate) : [];
+    const adHoc = adHocCardsForDate(date).filter(c => c.personId === person.id);
+    const pulledSubs = sent ? pulledSubtasksForDate(person, date) : [];
+    const manualSubs = manualSubtaskCardsForDate(person, date);
+
+    const sections = [];
+    const usedKeys = new Set();
+
+    function taskSection(c, pulled){
+      const raw = state.builds.find(b => b.id === c.buildId);
+      const jrTask = raw ? jobCardSourceTask(raw, c.taskId) : null;
+      const assignment = raw ? raw.taskAssignments[c.taskId] : null;
+      const checklist = jrTask ? checklistForCard(jrTask, assignment, c.buildId, c.taskId, c.hours, pulled ? c.pulledFromDate : date) : [];
+      usedKeys.add(c.buildId + '|' + c.taskId);
+      sections.push({
+        heading: `${jobIdentityLabel(c.jobNumber, c.dealer, c.customer)} — ${c.taskName}`,
+        sub: [c.machineType, `${c.hours}h planned`].filter(Boolean).join(' · ') + (pulled ? ` (scheduled ${fmtDateLong(c.pulledFromDate)})` : ''),
+        rows: checklist.map(st => ({ number: st.number || '', name: st.name, notes: st.notes || '', time: st.standardTime }))
+      });
+    }
+    cards.forEach(c => taskSection(c, false));
+    pulledTasks.forEach(c => taskSection(c, true));
+
+    // Manually-added sub-tasks for a job/task not already covered above (see renderEmployeeJobCard's identical
+    // grouping) get their own section, grouped by job then task — same shape as a real card.
+    const manualOnlyByBuild = new Map();
+    manualSubs.forEach(m => {
+      const key = m.buildId + '|' + m.taskId;
+      if (usedKeys.has(key)) return;
+      if (!manualOnlyByBuild.has(m.buildId)) manualOnlyByBuild.set(m.buildId, new Map());
+      const byTask = manualOnlyByBuild.get(m.buildId);
+      if (!byTask.has(m.taskId)) byTask.set(m.taskId, []);
+      byTask.get(m.taskId).push(m);
+    });
+    manualOnlyByBuild.forEach((byTask, buildId) => {
+      const build = state.builds.find(b => b.id === buildId);
+      if (!build) return;
+      const eff = effectiveBuildData(build);
+      byTask.forEach((items, taskId) => {
+        const task = state.tasks.find(t => t.id === taskId);
+        sections.push({
+          heading: `${jobIdentityLabel(eff.jobNumber, eff.dealer, eff.customer)} — ${task ? task.name : '(task)'}`,
+          sub: eff.machineType || '',
+          rows: items.map(m => ({ number: m.subtask.number || '', name: m.subtask.name, notes: m.subtask.notes || '', time: m.subtask.standardTime }))
+        });
+      });
+    });
+
+    if (pulledSubs.length){
+      sections.push({
+        heading: 'Pulled sub-tasks',
+        sub: '',
+        rows: pulledSubs.map(p => ({ number: p.subtask.number || '', name: `${jobIdentityLabel(p.jobNumber, p.dealer, p.customer)} — ${p.taskName} — ${p.subtask.name}`, notes: p.subtask.notes || '', time: p.subtask.standardTime }))
+      });
+    }
+
+    const adHocRows = adHoc.map(c => ({ label: adHocCardTitle(c), hours: c.hours, note: c.note || '' }));
+
+    const wrap = document.createElement('div'); wrap.className = 'print-card';
+    const h1 = document.createElement('h1'); h1.textContent = 'SOUTHERN SPREADERS — JOB CARD';
+    wrap.appendChild(h1);
+    const subEl = document.createElement('div'); subEl.className = 'print-sub';
+    subEl.textContent = `${person.name || '(unnamed)'} — ${fmtDateLong(date)}`;
+    wrap.appendChild(subEl);
+    const meta = document.createElement('div'); meta.className = 'print-meta';
+    meta.textContent = `Printed ${new Date().toLocaleString()} — for hand completion; enter the results back into Job Cards once things are working again.`;
+    wrap.appendChild(meta);
+
+    if (!sections.length && !adHocRows.length){
+      const empty = document.createElement('div'); empty.style.marginTop = '16px';
+      empty.textContent = 'Nothing scheduled for this person on this date yet.';
+      wrap.appendChild(empty);
+    }
+
+    sections.forEach(sec => {
+      const secWrap = document.createElement('div'); secWrap.className = 'print-section';
+      const h2 = document.createElement('h2'); h2.textContent = sec.heading;
+      secWrap.appendChild(h2);
+      if (sec.sub){
+        const s2 = document.createElement('div'); s2.className = 'print-sub2'; s2.textContent = sec.sub;
+        secWrap.appendChild(s2);
+      }
+      if (sec.rows.length){
+        const table = document.createElement('table'); table.className = 'print-table';
+        table.innerHTML = '<thead><tr><th>#</th><th>Sub-task</th><th>Notes</th><th>Std hrs</th><th>Hours worked</th><th>Done</th></tr></thead>';
+        const tbody = document.createElement('tbody');
+        sec.rows.forEach(r => {
+          const tr = document.createElement('tr');
+          [r.number, r.name, r.notes, r.time].forEach(v => { const td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
+          tr.appendChild(document.createElement('td')).className = 'print-blank';
+          tr.appendChild(document.createElement('td')).className = 'print-checkbox';
+          tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        secWrap.appendChild(table);
+      } else {
+        const line = document.createElement('div'); line.className = 'print-blank-line';
+        line.textContent = 'Hours worked: _______________     Done: ☐';
+        secWrap.appendChild(line);
+      }
+      wrap.appendChild(secWrap);
+    });
+
+    if (adHocRows.length){
+      const secWrap = document.createElement('div'); secWrap.className = 'print-section';
+      const h2 = document.createElement('h2'); h2.textContent = 'Lost time / Rework / Other';
+      secWrap.appendChild(h2);
+      const table = document.createElement('table'); table.className = 'print-table';
+      table.innerHTML = '<thead><tr><th>Description</th><th>Note</th><th>Hours</th></tr></thead>';
+      const tbody = document.createElement('tbody');
+      adHocRows.forEach(r => {
+        const tr = document.createElement('tr');
+        const tdLabel = document.createElement('td'); tdLabel.textContent = r.label; tr.appendChild(tdLabel);
+        const tdNote = document.createElement('td'); tdNote.textContent = r.note; tr.appendChild(tdNote);
+        const tdHours = document.createElement('td');
+        if (r.hours){ tdHours.textContent = r.hours + 'h'; } else { tdHours.className = 'print-blank'; }
+        tr.appendChild(tdHours);
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      secWrap.appendChild(table);
+      wrap.appendChild(secWrap);
+    }
+
+    const footer = document.createElement('div'); footer.className = 'print-footer';
+    const sigLine = document.createElement('div'); sigLine.textContent = 'Employee signature: _______________________     Date: _______________';
+    footer.appendChild(sigLine);
+    const enteredLine = document.createElement('div'); enteredLine.style.marginTop = '14px';
+    enteredLine.textContent = 'Entered into system by: _______________________     Date: _______________';
+    footer.appendChild(enteredLine);
+    wrap.appendChild(footer);
+
+    return wrap;
+  }
+
+  // Prints one person's card. `alsoBreak` adds a page-break after it, for stacking several via printAllJobCards.
+  function printJobCard(person, date){
+    const area = document.getElementById('printArea');
+    area.innerHTML = '';
+    area.appendChild(printableJobCardEl(person, date));
+    window.print();
+  }
+
+  function printAllJobCards(date, people){
+    const area = document.getElementById('printArea');
+    area.innerHTML = '';
+    people.forEach((p, i) => {
+      const el = printableJobCardEl(p, date);
+      if (i < people.length - 1) el.classList.add('print-page-break');
+      area.appendChild(el);
+    });
+    window.print();
+  }
+
   function renderJobCardsLivePage(){
     const container = document.getElementById('jobCardsLiveSection');
     container.innerHTML = '';
@@ -6426,6 +6618,24 @@
       }
     } else {
       listPanel.innerHTML = '<h2>Employees</h2>';
+      // A paper fallback for a broken tablet or a new starter without a login yet — prints every person's card
+      // for the selected date in one go (one page each), left blank for hand completion and keyed back in later.
+      const printAllRow = document.createElement('div'); printAllRow.style.marginTop = '6px';
+      const printAllBtn = document.createElement('button'); printAllBtn.className = 'ghost icon';
+      printAllBtn.textContent = '🖨 Print all cards for this date';
+      printAllBtn.addEventListener('click', () => {
+        const peopleWithWork = sortedPeople().filter(p => {
+          const sent = isPersonDateLocked(p.id, jobCardsView.date);
+          const hasCards = sent && buildJobCardsForDate(jobCardsView.date).some(c => isCardForPerson(c, p.id));
+          const hasAdHoc = adHocCardsForDate(jobCardsView.date).some(c => c.personId === p.id);
+          const hasManual = manualSubtaskCardsForDate(p, jobCardsView.date).length > 0;
+          return hasCards || hasAdHoc || hasManual;
+        });
+        if (!peopleWithWork.length){ alert('Nothing to print — no one has work on this date yet.'); return; }
+        printAllJobCards(jobCardsView.date, peopleWithWork);
+      });
+      printAllRow.appendChild(printAllBtn);
+      listPanel.appendChild(printAllRow);
     }
 
     if (!state.people.length){
@@ -6478,6 +6688,12 @@
       const main = document.createElement('div'); main.className = 'drill-main';
       main.textContent = p.name || '(unnamed)';
       row.appendChild(main);
+      // Paper fallback for this one person — a broken tablet or a new starter without a login yet.
+      const printBtn = document.createElement('button'); printBtn.className = 'ghost icon'; printBtn.textContent = '🖨';
+      printBtn.style.marginLeft = 'auto'; printBtn.style.flexShrink = '0';
+      printBtn.title = 'Print a blank paper copy of this card, for hand completion later.';
+      printBtn.addEventListener('click', (e) => { e.stopPropagation(); printJobCard(p, date); });
+      row.appendChild(printBtn);
       const expanded = jobCardsLiveExpanded.has(p.id);
       const meta = document.createElement('div'); meta.className = 'drill-meta';
       meta.textContent = !sent
