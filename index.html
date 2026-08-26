@@ -4261,9 +4261,12 @@
     return eff.jobRecord ? eff.jobRecord.tasks.find(t => t.taskRefId === taskId) : null;
   }
 
-  // Every selected sub-task on a job-linked build, each paired with a display label for its owning task —
-  // used by the "Add work to this card" form's optional Sub-task picker. Narrows to one task's subtasks if
-  // taskId is given, otherwise lists across the whole job. Returns [] for a build with no job record.
+  // Every selected, not-yet-done sub-task on a job-linked build, each paired with a display label for its
+  // owning task — used by the "Add work to this card" form's optional Sub-task picker. Narrows to one task's
+  // subtasks if taskId is given, otherwise lists across the whole job. Returns [] for a build with no job
+  // record. A sub-task the employee has already ticked complete (on this day or an earlier one) is excluded
+  // even if its task as a whole hasn't been signed off yet — it's finished, so re-adding it would just create
+  // a duplicate entry for work already done.
   function jobSubtasksForBuild(buildId, taskId){
     const build = state.builds.find(b => b.id === buildId);
     if (!build) return [];
@@ -4273,7 +4276,7 @@
       .filter(t => !taskSignedOffComplete(buildId, t.taskRefId));
     const result = [];
     tasks.forEach(t => {
-      (t.subtasks || []).forEach(st => { if (st.selected) result.push({ subtask: st, taskId: t.taskRefId, taskName: jobTaskDisplayName(t) }); });
+      (t.subtasks || []).forEach(st => { if (st.selected && !st.completed) result.push({ subtask: st, taskId: t.taskRefId, taskName: jobTaskDisplayName(t) }); });
     });
     return result;
   }
@@ -4610,7 +4613,9 @@
     }
 
     if (jrTask && assignment && cardDate){
-      const remaining = includedSubtasksForAssignment(jrTask, assignment).filter(st => !checklist.some(c => c.id === st.id));
+      // Already-completed sub-tasks (from this day or an earlier one) are done — don't offer them back up as
+      // something to overschedule onto a day.
+      const remaining = includedSubtasksForAssignment(jrTask, assignment).filter(st => !checklist.some(c => c.id === st.id) && !st.completed);
       if (remaining.length){
         const addRow = document.createElement('div'); addRow.className = 'field-row'; addRow.style.marginTop = '10px';
         const sel = document.createElement('select');
@@ -5045,7 +5050,9 @@
       if (opts.pulled || (cb && cb.checked)){
         const raw = state.builds.find(b => b.id === c.buildId);
         const jrTask = jobCardSourceTask(raw, c.taskId);
-        const selectedSubtasks = jrTask ? jrTask.subtasks.filter(st => st.selected) : [];
+        // Already-completed sub-tasks don't need (re-)assigning — this is the planning checklist, not the
+        // employee's own day-of card, so a finished sub-task just has nothing left to tick here.
+        const selectedSubtasks = jrTask ? jrTask.subtasks.filter(st => st.selected && !st.completed) : [];
         if (selectedSubtasks.length){
           const assignment = raw.taskAssignments[c.taskId];
           const excluded = new Set(assignment.excludedSubtasks || []);
