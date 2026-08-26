@@ -544,6 +544,13 @@
   // record if missing) and findOrCreateFactoryMaintenanceEntry (creates/reuses today's ad-hoc entry against it).
   const FACTORY_MAINT_JOB_ID = 'jr-factory-maintenance';
 
+  // A day's checklist (see checklistForCard) deliberately targets more than the day's own planned hours, so an
+  // employee who works faster than the standard time never runs out of queued sub-tasks and has to wait on a
+  // manager. Only affects which sub-tasks land on a card — the scheduling engine's own day-by-day capacity and
+  // finish-date math (hoursBeforeDate, runSchedule) is untouched, so this is purely a display/auto-fill buffer,
+  // not a change to how much the shop is actually scheduled to get through.
+  const CHECKLIST_OVERSCHEDULE_FACTOR = 1.25;
+
   function uid(p){ return p + Math.random().toString(36).slice(2,9); }
   function colorFor(i){ return PALETTE[i % PALETTE.length]; }
   function cloneDeps(map){ const out = {}; Object.keys(map||{}).forEach(k => out[k] = [...(map[k]||[])]); return out; }
@@ -4369,18 +4376,30 @@
   // day's card (which used to happen: the scheduling engine always re-simulates a task's remaining hours
   // starting fresh from "today", so a finished sub-task's old window position could get re-offered, along with
   // its hours getting re-counted, days after it was actually done).
+  //
+  // A manually excluded sub-task (someone else is doing it, or this build's variant doesn't need it) is taken
+  // off the same way, for the same reason: it isn't real work for THIS person on ANY day, so it shouldn't keep
+  // reserving a slot on their timeline either. It used to still advance the cursor even while hidden, which
+  // meant a handful of legitimately-excluded sub-tasks could quietly eat hours' worth of window space, leaving
+  // the day under-filled with real (visible) work even though the plan hours were never in doubt. Both filters
+  // apply globally (not per-date) so every day's call sees the identical, already-compacted list — otherwise a
+  // sub-task compacted into view on one day could also still be sitting in its old spot on another.
+  //
+  // windowEnd deliberately reaches CHECKLIST_OVERSCHEDULE_FACTOR times past the day's own planned hours (see
+  // its own comment) — pulling ahead into what would otherwise be a later day's slice. That's harmless and
+  // self-correcting: whatever doesn't actually get finished today simply isn't complete, so it's still sitting
+  // there — in its own compacted, no-longer-duplicated spot — for whichever day picks it up next.
   function checklistForCard(jrTask, assignment, buildId, taskId, hours, date){
     const excluded = new Set(assignment ? assignment.excludedSubtasks : []);
     const extra = new Set((assignment && assignment.extraSubtasksByDate && assignment.extraSubtasksByDate[date]) || []);
-    const allSelected = (jrTask ? jrTask.subtasks : []).filter(st => st.selected && !st.completed);
+    const allSelected = (jrTask ? jrTask.subtasks : []).filter(st => st.selected && !st.completed && !excluded.has(st.id));
     const windowStart = date ? hoursBeforeDate(buildId, taskId, date) : 0;
-    const windowEnd = windowStart + (Number(hours) || 0);
+    const windowEnd = windowStart + (Number(hours) || 0) * CHECKLIST_OVERSCHEDULE_FACTOR;
     let cursor = 0;
     const result = [];
     allSelected.forEach(st => {
       const start = cursor;
       cursor += Number(st.standardTime) || 0;
-      if (excluded.has(st.id)) return;
       if (extra.has(st.id)){ result.push(st); return; }
       if (start < windowEnd && cursor > windowStart) result.push(st);
     });
