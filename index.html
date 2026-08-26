@@ -4371,13 +4371,17 @@
   // overschedule a day by adding a sub-task beyond that window (assignment.extraSubtasksByDate); those always
   // show regardless.
   //
-  // A completed sub-task is taken off this list entirely, not just hidden for today — it's filtered out before
-  // the cursor walk even starts, so it never occupies a slot on the timeline and can't come back on some later
-  // day's card (which used to happen: the scheduling engine always re-simulates a task's remaining hours
-  // starting fresh from "today", so a finished sub-task's old window position could get re-offered, along with
-  // its hours getting re-counted, days after it was actually done).
+  // A completed sub-task stays on the list by default — the employee's own live card, sign-off, print, and
+  // every other review/detail view all need to keep showing what's actually done (ticked, reopenable) rather
+  // than having it vanish the moment it's marked complete. `excludeCompleted` is only passed `true` by the
+  // assignment-planning call sites (Job Card Setup's Assign checklist and its "Assigned: Xh" total) — a
+  // completed sub-task genuinely has nothing left to assign, so it's taken off THOSE lists entirely (filtered
+  // out before the cursor walk even starts, so it never occupies a slot on the timeline and can't come back on
+  // some later day's card, which used to happen: the scheduling engine always re-simulates a task's remaining
+  // hours starting fresh from "today", so a finished sub-task's old window position could get re-offered, along
+  // with its hours getting re-counted, days after it was actually done).
   //
-  // A manually excluded sub-task is deliberately NOT taken off the timeline the way completed ones are — it
+  // A manually excluded sub-task is never taken off the timeline this way, regardless of excludeCompleted — it
   // still advances the cursor, just hidden from the result. Unticking a sub-task is the user choosing to
   // underschedule this specific day (someone else is doing it, or it's not needed), not asking for something
   // else to automatically backfill the gap; if excluded sub-tasks compacted the timeline too, unticking one
@@ -4390,10 +4394,10 @@
   // its own comment) — pulling ahead into what would otherwise be a later day's slice. That's harmless and
   // self-correcting: whatever doesn't actually get finished today simply isn't complete, so it's still sitting
   // there — in its own compacted, no-longer-duplicated spot — for whichever day picks it up next.
-  function checklistForCard(jrTask, assignment, buildId, taskId, hours, date){
+  function checklistForCard(jrTask, assignment, buildId, taskId, hours, date, excludeCompleted){
     const excluded = new Set(assignment ? assignment.excludedSubtasks : []);
     const extra = new Set((assignment && assignment.extraSubtasksByDate && assignment.extraSubtasksByDate[date]) || []);
-    const allSelected = (jrTask ? jrTask.subtasks : []).filter(st => st.selected && !st.completed);
+    const allSelected = (jrTask ? jrTask.subtasks : []).filter(st => st.selected && !(excludeCompleted && st.completed));
     const windowStart = date ? hoursBeforeDate(buildId, taskId, date) : 0;
     const windowEnd = windowStart + (Number(hours) || 0) * CHECKLIST_OVERSCHEDULE_FACTOR;
     let cursor = 0;
@@ -5016,7 +5020,7 @@
       const jrTask = jobCardSourceTask(raw, c.taskId);
       if (!jrTask) return 0;
       const assignment = raw.taskAssignments[c.taskId];
-      return checklistForCard(jrTask, assignment, c.buildId, c.taskId, c.hours, cardDate).reduce((s, st) => s + (Number(st.standardTime) || 0), 0);
+      return checklistForCard(jrTask, assignment, c.buildId, c.taskId, c.hours, cardDate, true).reduce((s, st) => s + (Number(st.standardTime) || 0), 0);
     }
     const cardKeysForHours = new Set(cards.map(c => c.buildId + '|' + c.taskId));
     const assignedHours = cards.filter(c => c.assignedPersonId === person.id).reduce((s, c) => s + tickedSubtaskHours(c, date), 0)
@@ -5135,8 +5139,8 @@
           // that set on the very next render, flipping `inBudget` to false — so re-ticking it would start
           // writing to extraSubtasksByDate instead of clearing excludedSubtasks, and since checklistForCard
           // checks excludedSubtasks first, the sub-task could never be brought back at all.
-          const actuallyIncluded = new Set(checklistForCard(jrTask, assignment, c.buildId, c.taskId, c.hours, cardDate).map(st => st.id));
-          const naturalBudget = new Set(checklistForCard(jrTask, { ...assignment, excludedSubtasks: [] }, c.buildId, c.taskId, c.hours, cardDate).map(st => st.id));
+          const actuallyIncluded = new Set(checklistForCard(jrTask, assignment, c.buildId, c.taskId, c.hours, cardDate, true).map(st => st.id));
+          const naturalBudget = new Set(checklistForCard(jrTask, { ...assignment, excludedSubtasks: [] }, c.buildId, c.taskId, c.hours, cardDate, true).map(st => st.id));
           const subWrap = document.createElement('div'); subWrap.className = 'dep-list'; subWrap.style.marginTop = '8px'; subWrap.style.paddingLeft = '26px';
           selectedSubtasks.forEach(st => {
             const subLabel = document.createElement('label'); subLabel.className = 'dep-item';
