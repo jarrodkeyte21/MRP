@@ -4269,7 +4269,8 @@
     if (!build) return [];
     const eff = effectiveBuildData(build);
     if (!eff.jobRecord) return [];
-    const tasks = taskId ? eff.jobRecord.tasks.filter(t => t.taskRefId === taskId) : eff.jobRecord.tasks;
+    const tasks = (taskId ? eff.jobRecord.tasks.filter(t => t.taskRefId === taskId) : eff.jobRecord.tasks)
+      .filter(t => !taskSignedOffComplete(buildId, t.taskRefId));
     const result = [];
     tasks.forEach(t => {
       (t.subtasks || []).forEach(st => { if (st.selected) result.push({ subtask: st, taskId: t.taskRefId, taskName: jobTaskDisplayName(t) }); });
@@ -4299,6 +4300,17 @@
     if (!jrTask) return false;
     const selected = (jrTask.subtasks || []).filter(st => st.selected);
     return selected.length > 0 && selected.every(st => st.completed);
+  }
+
+  // True once a manager has signed a build/task off as complete on ANY date — that task is genuinely finished,
+  // so it shouldn't be offered again in the "Add work to this card" / "Add task manually" pickers (see
+  // jobSubtasksForBuild and its Task dropdown). Rework against a finished task goes through its own direct
+  // button instead of this picker, so it's unaffected by this filter.
+  function taskSignedOffComplete(buildId, taskId){
+    return Object.values(state.actuals).some(byBuild => {
+      const rec = byBuild[buildId] && byBuild[buildId][taskId];
+      return rec && rec.complete;
+    });
   }
 
   // Sub-tasks that actually belong on a person's card for this task: selected in the Jobs tab AND not
@@ -5338,7 +5350,8 @@
       const build = jobSel.value ? state.builds.find(b => b.id === jobSel.value) : null;
       const eff = build ? effectiveBuildData(build) : null;
       const relevantIds = eff && eff.jobRecord ? Array.from(new Set(eff.jobRecord.tasks.map(t => t.taskRefId).filter(Boolean))) : null;
-      const tasksToShow = relevantIds ? state.tasks.filter(t => relevantIds.includes(t.id)) : state.tasks;
+      const tasksToShow = (relevantIds ? state.tasks.filter(t => relevantIds.includes(t.id)) : state.tasks)
+        .filter(t => !jobSel.value || !taskSignedOffComplete(jobSel.value, t.id));
       tasksToShow.forEach(t => {
         const opt = document.createElement('option'); opt.value = t.id; opt.textContent = t.name;
         taskSel.appendChild(opt);
