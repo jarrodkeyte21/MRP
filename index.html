@@ -470,6 +470,7 @@
   <section class="panel row-gap">
     <h2>Resource pools</h2>
     <div class="hint">Capacity is driven by headcount: employees × shift hours for that weekday, plus overtime if staffed. Set employees and shift length once below; use an override to change headcount for a date range (staff leave, a new hire, public holidays) — shift length and overtime rate stay fixed. Drag the ⠿ handle to reorder pools.</div>
+    <div id="shutdownList" style="margin-bottom:14px"></div>
     <div id="poolTimeline"></div>
     <div id="poolList" style="margin-top:14px"></div>
     <div style="margin-top:10px"><button class="ghost icon" id="btnAddPool">+ Add pool</button></div>
@@ -1052,6 +1053,10 @@
   // Whoever's actually logged in and performing an action right now — a floor login maps straight to their
   // own person record, a manager falls back to their login email since managers aren't necessarily linked to
   // a person at all. Used to tag work added manually (not part of the normal schedule) with who added it.
+  // Managers only — in local-only mode (no Supabase, no login) there's no profile at all and everything is open.
+  function isManagerUser(){
+    return currentProfile ? currentProfile.role === 'manager' : !sb;
+  }
   function currentActorName(){
     if (currentProfile && currentProfile.person_id){
       const p = state.people.find(x => x.id === currentProfile.person_id);
@@ -1255,6 +1260,13 @@
     if (!state.actuals) state.actuals = {};
     if (!state.cardOrder) state.cardOrder = {};
     if (!state.dayFinished) state.dayFinished = {};
+    if (!Array.isArray(state.shutdowns)) state.shutdowns = [];
+    state.shutdowns.forEach(s => {
+      if (!s.id) s.id = uid('sd');
+      if (!s.start) s.start = state.meta.startDate;
+      if (!s.end || s.end < s.start) s.end = s.start;
+      if (s.note === undefined) s.note = '';
+    });
     if (!state.sickDays) state.sickDays = {};
     if (!state.financialReports) state.financialReports = [];
     state.financialReports.forEach(r => {
@@ -1624,7 +1636,13 @@
   // Capacity is headcount-driven: employees × shift hours for that weekday, plus employees on overtime × the
   // pool's overtime hours. Overrides (staff leave, temporary hires) only ever change employee counts — shift
   // length and overtime rate are shop policy and always come from the base pool, never from an override.
+  // Shop-wide shutdown (Christmas break, plant maintenance…): every pool has zero capacity on any date inside a
+  // shutdown period, regardless of weekday defaults or overrides. Inclusive of both start and end dates.
+  function isShutdownOn(dateISO){
+    return (state.shutdowns || []).some(s => s.start <= dateISO && dateISO <= s.end);
+  }
   function poolHoursOn(pool, dateISO){
+    if (isShutdownOn(dateISO)) return 0;
     const weekStart = mondayOf(dateISO);
     const active = activeOverrideForWeek(pool, weekStart);
     const dow = parseISO(dateISO).getDay();
@@ -1637,6 +1655,7 @@
   // Hours available per employee that day, including the overtime bonus if overtime is staffed — used to convert
   // a "max people on this build at once" figure into an hours cap.
   function poolShiftHoursOn(pool, dateISO){
+    if (isShutdownOn(dateISO)) return 0;
     const weekStart = mondayOf(dateISO);
     const active = activeOverrideForWeek(pool, weekStart);
     const dow = parseISO(dateISO).getDay();
@@ -2766,6 +2785,65 @@
 
       wrap.appendChild(card);
     });
+  }
+
+  // ---------- render: shop-wide shutdown periods (every pool at zero capacity for the date range) ----------
+  function renderShutdownList(){
+    const wrap = document.getElementById('shutdownList');
+    wrap.innerHTML = '';
+    const head = document.createElement('div'); head.className = 'pool-subhead'; head.textContent = 'Shutdown periods';
+    wrap.appendChild(head);
+    const hint = document.createElement('div'); hint.className = 'hint'; hint.style.marginBottom = '8px';
+    hint.textContent = 'Shop-wide closures (Christmas break, plant maintenance) — every pool has zero capacity from the first date to the last date inclusive, and work simply resumes afterward.';
+    wrap.appendChild(hint);
+
+    state.shutdowns.sort((a,b) => a.start < b.start ? -1 : a.start > b.start ? 1 : 0);
+    if (state.shutdowns.length === 0){
+      const empty = document.createElement('div'); empty.className = 'dep-empty';
+      empty.textContent = 'No shutdown periods.';
+      wrap.appendChild(empty);
+    }
+    state.shutdowns.forEach(s => {
+      const row = document.createElement('div'); row.className = 'override-card-head'; row.style.marginBottom = '6px';
+      const fromLabel = document.createElement('span'); fromLabel.className = 'wk-label'; fromLabel.textContent = 'From';
+      row.appendChild(fromLabel);
+      const startInp = document.createElement('input'); startInp.type = 'date'; startInp.value = s.start;
+      startInp.addEventListener('change', () => {
+        if (!startInp.value) return;
+        s.start = startInp.value;
+        if (s.end < s.start) s.end = s.start;
+        save(); renderShutdownList(); renderResults();
+      });
+      row.appendChild(startInp);
+      const toLabel = document.createElement('span'); toLabel.className = 'wk-label'; toLabel.textContent = 'to';
+      row.appendChild(toLabel);
+      const endInp = document.createElement('input'); endInp.type = 'date'; endInp.value = s.end;
+      endInp.addEventListener('change', () => {
+        if (!endInp.value) return;
+        s.end = endInp.value < s.start ? s.start : endInp.value;
+        save(); renderShutdownList(); renderResults();
+      });
+      row.appendChild(endInp);
+      const noteInp = document.createElement('input'); noteInp.type = 'text'; noteInp.placeholder = 'e.g. Christmas shutdown';
+      noteInp.value = s.note || '';
+      noteInp.addEventListener('input', () => { s.note = noteInp.value; save(); });
+      row.appendChild(noteInp);
+      const del = document.createElement('button'); del.className = 'icon ghost'; del.textContent = '✕';
+      del.addEventListener('click', () => {
+        state.shutdowns = state.shutdowns.filter(x => x.id !== s.id);
+        save(); renderShutdownList(); renderResults();
+      });
+      row.appendChild(del);
+      wrap.appendChild(row);
+    });
+    const addBtn = document.createElement('button'); addBtn.className = 'ghost icon'; addBtn.style.marginTop = '4px';
+    addBtn.textContent = '+ Add shutdown period';
+    addBtn.addEventListener('click', () => {
+      const start = state.meta.startDate;
+      state.shutdowns.push({ id: uid('sd'), start, end: start, note: '' });
+      save(); renderShutdownList(); renderResults();
+    });
+    wrap.appendChild(addBtn);
   }
 
   // ---------- render: merged override timeline across all pools ----------
@@ -5842,6 +5920,8 @@
   // credited at half value instead of double-counting two jobs run together in one blast/paint session. A
   // still-running other session is treated as ending "now" for this purpose.
   function logEntryHours(tl, obj){
+    // A manager-typed entry (see renderSubtaskPanel) carries its hours directly — no clock times to derive from.
+    if (tl.manual) return Math.max(0, Number(tl.manualHours) || 0);
     if (!tl.startTime || !tl.stopTime) return 0;
     let startMin = timeToMinutes(tl.startTime);
     let endMin = timeToMinutes(tl.stopTime);
@@ -9396,8 +9476,32 @@
     subHeading.textContent = 'Sub-tasks';
     wrap.appendChild(subHeading);
 
+    // Manager-only manual overrides on a real job's sub-tasks: tick complete and/or type in hours worked without
+    // anyone having clocked it. Templates have no work against them, so this is jobs-only.
+    const managerTools = jobsView.mode === 'job' && isManagerUser();
+    const todayISO = getTodayISO();
+    const manualLogOf = (st) => (st.timeLogs || []).find(tl => tl.manual);
+    const clockedHoursOf = (st) => (st.timeLogs || []).filter(tl => !tl.manual).reduce((s, tl) => s + logEntryHours(tl, st), 0);
+
+    if (managerTools && task.subtasks.length){
+      const bulkRow = document.createElement('div'); bulkRow.style.margin = '6px 0';
+      const allDone = task.subtasks.filter(s => s.selected).every(s => s.completed);
+      const bulkBtn = document.createElement('button'); bulkBtn.className = 'ghost icon';
+      bulkBtn.textContent = allDone ? '↩ Reopen all sub-tasks' : '✓ Mark whole task complete';
+      bulkBtn.title = 'Manager override — ticks every selected sub-task complete (or clears them all) without anyone clocking on.';
+      bulkBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        task.subtasks.filter(s => s.selected).forEach(s => { s.completed = !allDone; });
+        save(); renderJobsPage(); renderResults();
+      });
+      bulkRow.appendChild(bulkBtn);
+      wrap.appendChild(bulkRow);
+    }
+
     const table = document.createElement('table'); table.className = 'editor'; table.style.marginTop = '6px';
-    table.innerHTML = '<thead><tr><th style="width:70px">Task #</th><th>Task name</th><th>Task notes</th><th style="width:110px">Standard time</th><th style="width:60px">Selected</th><th></th></tr></thead>';
+    table.innerHTML = '<thead><tr><th style="width:70px">Task #</th><th>Task name</th><th>Task notes</th><th style="width:110px">Standard time</th><th style="width:60px">Selected</th>'
+      + (managerTools ? '<th style="width:60px" title="Manager override — mark this sub-task complete">Done</th><th style="width:230px" title="Total hours worked. Typing here adds a manual entry on top of any clocked time, dated as chosen.">Hours worked · date</th>' : '')
+      + '<th></th></tr></thead>';
     const tbody = document.createElement('tbody');
 
     task.subtasks.forEach(st => {
@@ -9451,6 +9555,47 @@
       });
       tdSel.appendChild(selCb); tr.appendChild(tdSel);
 
+      if (managerTools){
+        const tdDone = document.createElement('td'); tdDone.style.textAlign = 'center';
+        const doneCb = document.createElement('input'); doneCb.type = 'checkbox'; doneCb.checked = !!st.completed;
+        doneCb.addEventListener('click', (e) => e.stopPropagation());
+        doneCb.addEventListener('change', () => { st.completed = doneCb.checked; save(); renderJobsPage(); renderResults(); });
+        tdDone.appendChild(doneCb); tr.appendChild(tdDone);
+
+        // The typed number is the sub-task's TOTAL hours: the manual entry is whatever tops the clocked time up
+        // to it (never negative — hours already clocked can only be changed by editing those sessions).
+        const tdHrs = document.createElement('td');
+        const hrsInp = makeHourInput(Math.round(totalTimeUsedHours(st) * 100) / 100, (val) => {
+          const target = Number(val);
+          if (!isFinite(target) || target < 0) return;
+          const manualHours = Math.max(0, Math.round((target - clockedHoursOf(st)) * 100) / 100);
+          let ml = manualLogOf(st);
+          if (!ml){
+            if (manualHours === 0) return;
+            if (!Array.isArray(st.timeLogs)) st.timeLogs = [];
+            ml = { id: uid('tl'), personId: null, date: todayISO, startTime: '00:00', stopTime: '00:00', manual: true, manualHours: 0, addedBy: currentActorName() };
+            st.timeLogs.push(ml);
+          }
+          ml.manualHours = manualHours;
+          save();
+        });
+        hrsInp.style.width = '70px';
+        hrsInp.title = 'Total hours worked (clocked + manual). ' + (clockedHoursOf(st) > 0 ? `${Math.round(clockedHoursOf(st) * 100) / 100}h of it is clocked.` : 'Nothing clocked yet.');
+        hrsInp.addEventListener('click', (e) => e.stopPropagation());
+        hrsInp.addEventListener('change', () => { renderResults(); });
+        const hrsDate = document.createElement('input'); hrsDate.type = 'date';
+        hrsDate.value = (manualLogOf(st) || {}).date || todayISO;
+        hrsDate.title = 'Date the manual hours count against (for sign-off and reports).';
+        hrsDate.addEventListener('click', (e) => e.stopPropagation());
+        hrsDate.addEventListener('change', () => {
+          if (!hrsDate.value) return;
+          const ml = manualLogOf(st);
+          if (ml){ ml.date = hrsDate.value; save(); renderResults(); }
+        });
+        tdHrs.appendChild(hrsInp); tdHrs.appendChild(hrsDate);
+        tr.appendChild(tdHrs);
+      }
+
       const tdDel = document.createElement('td');
       const delBtn = document.createElement('button'); delBtn.className = 'icon ghost'; delBtn.textContent = '✕';
       delBtn.title = 'Remove sub-task';
@@ -9495,6 +9640,7 @@
 
   function renderAll(){
     renderTaskTable();
+    renderShutdownList();
     renderPoolTimeline();
     renderPoolList();
     renderPeopleSection(document.getElementById('peopleSection'));
@@ -9653,7 +9799,7 @@
     if (document.getElementById('page-schedule').style.display !== 'none'){
       renderBuildTable(); renderResults();
     } else if (document.getElementById('page-setup').style.display !== 'none'){
-      renderTaskTable(); renderPoolTimeline(); renderPoolList(); renderPeopleSection(document.getElementById('peopleSection')); renderBuildTaskHeaders();
+      renderTaskTable(); renderShutdownList(); renderPoolTimeline(); renderPoolList(); renderPeopleSection(document.getElementById('peopleSection')); renderBuildTaskHeaders();
     } else if (document.getElementById('page-history').style.display !== 'none'){
       renderJobHistory();
     } else if (document.getElementById('page-stock').style.display !== 'none'){
