@@ -323,6 +323,17 @@
     border-radius: 20px; padding: 4px 10px; font-size: 10.5px; font-family: var(--font-mono);
     text-transform: uppercase; letter-spacing: 0.04em; border: none; cursor: pointer; font-weight: 700;
   }
+  table.pool-month-table { width: 100%; border-collapse: collapse; margin-top: 10px; table-layout: fixed; }
+  table.pool-month-table th { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-muted); font-weight: 600; text-align: right; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--line); }
+  table.pool-month-table th.pm-name, table.pool-month-table td.pm-name { text-align: left; width: 130px; padding-left: 0; }
+  table.pool-month-table td { padding: 5px 8px 5px 0; border-bottom: 1px solid var(--line); vertical-align: bottom; }
+  table.pool-month-table td.pm-name { font-size: 12px; font-weight: 600; }
+  table.pool-month-table tr.pm-all td { font-weight: 700; border-top: 2px solid var(--line); }
+  .pm-pct { font-family: var(--font-mono); font-size: 10px; font-weight: 700; text-align: right; color: var(--accent); }
+  .pm-pct.hot { color: var(--warn); }
+  .pm-track { height: 4px; border-radius: 2px; background: var(--surface-2); margin-top: 2px; overflow: hidden; }
+  .pm-fill { height: 100%; background: var(--accent); }
+  .pm-fill.hot { background: var(--warn); }
   select.status-scheduled { background: var(--surface-2); color: var(--ink-muted); }
   select.status-build_sheet_released { background: #7D6BAE; color: #fff; }
   select.status-ordered { background: var(--accent); color: var(--accent-ink); }
@@ -1596,6 +1607,7 @@
   // mode distinguishes which collection recordId refers to when level is 'tasks': 'job' or 'template'.
   let jobsView = { level: 'main', mode: null, recordId: null, expandedTaskId: null };
   let jobsShowCompleted = false;
+  let poolMonthlyOpen = true;
   let optionsExpanded = new Set();
   let optionsAppliedExpanded = new Set();
   let optionsAppliedTaskExpanded = new Set(); // keyed `${optionId}|${taskId}`
@@ -3421,8 +3433,13 @@
   function renderPoolMonthlyUsage(dailyPoolUsage){
     const wrap = document.getElementById('poolMonthlySection');
     if (!wrap) return;
-    wrap.innerHTML = '<h2>Labour pool use by month</h2><div class="hint">Share of each pool\'s available hours (headcount × shift, plus overtime, less shutdowns) that scheduled work uses in each month. The current and final months only count capacity from the first scheduled day / to month end.</div>';
-    if (!dailyPoolUsage.length || !state.pools.length) return;
+    wrap.innerHTML = '';
+    const heading = document.createElement('h2'); heading.style.cursor = 'pointer'; heading.style.userSelect = 'none';
+    heading.textContent = (poolMonthlyOpen ? '▾ ' : '▸ ') + 'Labour pool use by month';
+    heading.title = 'Share of each pool\'s available hours (headcount × shift, plus overtime, less shutdowns) that scheduled work uses in each month. The current and final months only count capacity from the first scheduled day / to month end.';
+    heading.addEventListener('click', () => { poolMonthlyOpen = !poolMonthlyOpen; renderPoolMonthlyUsage(dailyPoolUsage); });
+    wrap.appendChild(heading);
+    if (!poolMonthlyOpen || !dailyPoolUsage.length || !state.pools.length) return;
 
     const firstDate = dailyPoolUsage[0].date;
     const lastDate = dailyPoolUsage[dailyPoolUsage.length - 1].date;
@@ -3452,30 +3469,45 @@
       }
     });
 
-    const table = document.createElement('table'); table.className = 'build-summary'; table.style.marginTop = '10px';
+    // Each month cell is the % (right-aligned, over a thin bar) — amber from 85% up, teal below, "—" with an
+    // empty track when the pool has no capacity that month. The last row pools every pool together.
+    const table = document.createElement('table'); table.className = 'pool-month-table';
     const head = document.createElement('tr');
-    head.innerHTML = '<th>Pool</th>' + months.map(m => `<th>${MONTH_NAMES[m.month].slice(0,3)} ${m.year}</th>`).join('');
+    head.innerHTML = '<th class="pm-name">Labour pool</th>' + months.map(m => `<th>${MONTH_NAMES[m.month].slice(0,3)} ${m.year}</th>`).join('');
     const thead = document.createElement('thead'); thead.appendChild(head); table.appendChild(thead);
     const tbody = document.createElement('tbody');
+    function usageCell(used, cap){
+      const td = document.createElement('td');
+      const pctEl = document.createElement('div'); pctEl.className = 'pm-pct';
+      const track = document.createElement('div'); track.className = 'pm-track';
+      if (cap <= 0){
+        pctEl.textContent = '—'; td.title = 'No capacity this month';
+      } else {
+        const pct = Math.round(used / cap * 100);
+        pctEl.textContent = pct + '%';
+        td.title = `${Math.round(used * 10) / 10}h used of ${Math.round(cap * 10) / 10}h available`;
+        const fill = document.createElement('div'); fill.className = 'pm-fill' + (pct >= 85 ? ' hot' : '');
+        fill.style.width = Math.min(100, pct) + '%';
+        track.appendChild(fill);
+        if (pct >= 85) pctEl.classList.add('hot');
+      }
+      td.appendChild(pctEl); td.appendChild(track);
+      return td;
+    }
     state.pools.forEach(p => {
       const tr = document.createElement('tr');
-      const nameTd = document.createElement('td'); nameTd.textContent = p.name; tr.appendChild(nameTd);
-      months.forEach(m => {
-        const t = totals[p.id + '|' + m.key];
-        const td = document.createElement('td'); td.className = 'num';
-        if (t.cap <= 0){
-          td.textContent = '—'; td.title = 'No capacity this month';
-        } else {
-          const pct = Math.round(t.used / t.cap * 100);
-          td.textContent = pct + '%';
-          td.title = `${Math.round(t.used * 10) / 10}h used of ${Math.round(t.cap * 10) / 10}h available`;
-          if (pct >= 100){ td.style.color = '#c0392b'; td.style.fontWeight = '700'; }
-          else if (pct >= 85){ td.style.color = '#b9770e'; td.style.fontWeight = '700'; }
-        }
-        tr.appendChild(td);
-      });
+      const nameTd = document.createElement('td'); nameTd.className = 'pm-name'; nameTd.textContent = p.name; tr.appendChild(nameTd);
+      months.forEach(m => { const t = totals[p.id + '|' + m.key]; tr.appendChild(usageCell(t.used, t.cap)); });
       tbody.appendChild(tr);
     });
+    const allTr = document.createElement('tr'); allTr.className = 'pm-all';
+    const allName = document.createElement('td'); allName.className = 'pm-name'; allName.textContent = 'All pools'; allTr.appendChild(allName);
+    months.forEach(m => {
+      let used = 0, cap = 0;
+      state.pools.forEach(p => { const t = totals[p.id + '|' + m.key]; used += t.used; cap += t.cap; });
+      allTr.appendChild(usageCell(used, cap));
+    });
+    tbody.appendChild(allTr);
     table.appendChild(tbody);
     const scroll = document.createElement('div'); scroll.className = 'scroll-x'; scroll.appendChild(table);
     wrap.appendChild(scroll);
