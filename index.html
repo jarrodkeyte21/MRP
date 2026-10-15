@@ -452,6 +452,8 @@
       <button class="primary" id="btnAddBuild">+ Add build</button>
     </div>
   </section>
+
+  <section class="panel row-gap" id="poolMonthlySection"></section>
 </div>
 
 <div id="page-setup" style="display:none">
@@ -3142,6 +3144,8 @@
     const prevGanttScroll = section.querySelector('.gantt-scroll');
     const ganttScrollLeft = prevGanttScroll ? prevGanttScroll.scrollLeft : 0;
     section.innerHTML = '';
+    const monthlyEl = document.getElementById('poolMonthlySection');
+    if (monthlyEl) monthlyEl.innerHTML = '';
 
     if (state.tasks.length === 0){
       const p = document.createElement('div'); p.className = 'panel';
@@ -3407,6 +3411,74 @@
     if (stockPage && stockPage.style.display !== 'none') renderStock();
 
     renderMoveBuildPreviewPanel();
+    renderPoolMonthlyUsage(dailyPoolUsage);
+  }
+
+  // ---------- bottom of the Schedule page: % of each labour pool's capacity used per scheduled month. Capacity is
+  // counted from the first scheduled day through the end of each month (so the final month shows genuinely spare
+  // hours after the last job finishes, not just the days that happened to be simulated); shutdowns, overrides and
+  // weekends all flow in via poolHoursOn. ----------
+  function renderPoolMonthlyUsage(dailyPoolUsage){
+    const wrap = document.getElementById('poolMonthlySection');
+    if (!wrap) return;
+    wrap.innerHTML = '<h2>Labour pool use by month</h2><div class="hint">Share of each pool\'s available hours (headcount × shift, plus overtime, less shutdowns) that scheduled work uses in each month. The current and final months only count capacity from the first scheduled day / to month end.</div>';
+    if (!dailyPoolUsage.length || !state.pools.length) return;
+
+    const firstDate = dailyPoolUsage[0].date;
+    const lastDate = dailyPoolUsage[dailyPoolUsage.length - 1].date;
+    const usageByDate = new Map(dailyPoolUsage.map(d => [d.date, d.usage]));
+
+    const months = [];
+    const cur = parseISO(firstDate); cur.setDate(1);
+    const endMonthKey = monthKey(parseISO(lastDate));
+    while (monthKey(cur) <= endMonthKey && months.length < 240){
+      months.push({ key: monthKey(cur), year: cur.getFullYear(), month: cur.getMonth() });
+      cur.setMonth(cur.getMonth() + 1);
+    }
+
+    const totals = {}; // `${poolId}|${monthKey}` -> { used, cap }
+    state.pools.forEach(p => months.forEach(m => { totals[p.id + '|' + m.key] = { used: 0, cap: 0 }; }));
+    months.forEach(m => {
+      const daysInMonth = new Date(m.year, m.month + 1, 0).getDate();
+      for (let d = 1; d <= daysInMonth; d++){
+        const iso = toISO(new Date(m.year, m.month, d));
+        if (iso < firstDate) continue;
+        const usage = usageByDate.get(iso) || {};
+        state.pools.forEach(p => {
+          const t = totals[p.id + '|' + m.key];
+          t.cap += poolHoursOn(p, iso);
+          t.used += usage[p.id] || 0;
+        });
+      }
+    });
+
+    const table = document.createElement('table'); table.className = 'build-summary'; table.style.marginTop = '10px';
+    const head = document.createElement('tr');
+    head.innerHTML = '<th>Pool</th>' + months.map(m => `<th>${MONTH_NAMES[m.month].slice(0,3)} ${m.year}</th>`).join('');
+    const thead = document.createElement('thead'); thead.appendChild(head); table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    state.pools.forEach(p => {
+      const tr = document.createElement('tr');
+      const nameTd = document.createElement('td'); nameTd.textContent = p.name; tr.appendChild(nameTd);
+      months.forEach(m => {
+        const t = totals[p.id + '|' + m.key];
+        const td = document.createElement('td'); td.className = 'num';
+        if (t.cap <= 0){
+          td.textContent = '—'; td.title = 'No capacity this month';
+        } else {
+          const pct = Math.round(t.used / t.cap * 100);
+          td.textContent = pct + '%';
+          td.title = `${Math.round(t.used * 10) / 10}h used of ${Math.round(t.cap * 10) / 10}h available`;
+          if (pct >= 100){ td.style.color = '#c0392b'; td.style.fontWeight = '700'; }
+          else if (pct >= 85){ td.style.color = '#b9770e'; td.style.fontWeight = '700'; }
+        }
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    const scroll = document.createElement('div'); scroll.className = 'scroll-x'; scroll.appendChild(table);
+    wrap.appendChild(scroll);
   }
 
   // ---------- render: job history — every build that has ever existed, active or removed from Build summary,
