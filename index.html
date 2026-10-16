@@ -3216,6 +3216,7 @@
       group.builds.forEach(b => {
         const tr = document.createElement('tr');
         tr.innerHTML = buildStatsCellsHtml(b);
+        attachFlowMenu(tr, b.id);
 
         // Machine type colour-codes the sale: retail (any named customer) is green; a wholesale unit going to
         // the Hansa dealer specifically is flagged red so it stands out from other wholesale stock.
@@ -3352,6 +3353,7 @@
         }
         tr.appendChild(td);
       });
+      attachFlowMenu(tr, b.id);
       tbody.appendChild(tr);
     });
 
@@ -7141,6 +7143,133 @@
       actualHours != null ? actualHours : '', signedRec ? 'Yes' : 'No', signedRec ? signedRec.hours : '',
       signedRec ? (signedRec.complete ? 'Yes' : 'No') : ''
     ];
+  }
+
+  // ---------- project flow export: one job's tasks laid out in dependency order with when each became ready, when
+  // it actually started/finished, and why any gap between those happened — so it's obvious what is slowing the job
+  // down. Built from the same schedule runSchedule() produces, so it always matches the Gantt. ----------
+  function attachFlowMenu(el, buildId){
+    el.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      showCtxMenu(e.clientX, e.clientY, [
+        { label: 'Export project flow (CSV) — what slows this job down', onClick: () => exportProjectFlowCsv(buildId) }
+      ]);
+    });
+  }
+  function exportProjectFlowCsv(buildId){
+    const { builds } = runSchedule();
+    const b = builds.find(x => x.id === buildId);
+    if (!b){ alert('Couldn\'t find that job on the schedule.'); return; }
+    const rawBuild = state.builds.find(x => x.id === buildId);
+    const eff = rawBuild ? effectiveBuildData(rawBuild) : null;
+    const fmtD = (iso) => iso ? fmtShort(parseISO(iso)) + ' ' + iso.slice(0, 4) : '';
+    const nextDay = (iso) => toISO(addDays(parseISO(iso), 1));
+    const dayDiff = (a, c) => Math.round((parseISO(c) - parseISO(a)) / 86400000);
+
+    // Per-task facts from the allocations.
+    const info = {};
+    state.tasks.forEach(t => {
+      const allocs = b.allocations.filter(a => a.taskId === t.id);
+      const ts = b.tstates.find(x => x.taskId === t.id);
+      const dates = Array.from(new Set(allocs.map(a => a.date))).sort();
+      info[t.id] = {
+        task: t, ts, allocs, dates,
+        hours: allocs.reduce((s, a) => s + a.hours, 0),
+        first: dates[0] || null, last: dates[dates.length - 1] || null,
+        pool: state.pools.find(p => p.id === t.poolId) || null
+      };
+    });
+    const worked = state.tasks.filter(t => info[t.id].dates.length || (info[t.id].ts && info[t.id].ts.hoursPlan > 0));
+
+    // Why was a pool unavailable to this job on a date? Shutdown and non-working days are nobody's fault; a day
+    // the pool had hours but this task didn't get any means other (higher-priority) jobs, a people cap, or a
+    // dependency that was worked that same day took them.
+    function reasonFor(info1, dateISO){
+      if (isShutdownOn(dateISO)) return 'shutdown';
+      if (info1.pool && poolHoursOn(info1.pool, dateISO) <= 0) return 'non-working day';
+      return 'pool busy / other jobs first';
+    }
+    function tally(info1, fromISO, toISO_){
+      const out = { 'shutdown': 0, 'non-working day': 0, 'pool busy / other jobs first': 0 };
+      if (!fromISO || !toISO_) return out;
+      for (let d = fromISO; d < toISO_; d = nextDay(d)){
+        if (info1.dates.includes(d)) continue;
+        out[reasonFor(info1, d)]++;
+      }
+      return out;
+    }
+
+    // Ready date = the day after the last of its dependencies finishes (a dependency finishing today can't be
+    // followed by its dependent until tomorrow); with no dependencies, the date materials/order allow work.
+    worked.forEach(t => {
+      const i = info[t.id];
+      const deps = (b.dependsOn[t.id] || []).filter(id => info[id] && info[id].last);
+      i.depFinish = deps.reduce((m, id) => (!m || info[id].last > m) ? info[id].last : m, null);
+      i.gatingDep = deps.find(id => info[id].last === i.depFinish) || null;
+      i.ready = i.depFinish ? nextDay(i.depFinish) : (b.earliestStartDate || i.first);
+      if (i.ready && i.first && i.ready > i.first) i.ready = i.first; // history signed off ahead of the plan
+      i.wait = tally(i, i.ready, i.first);
+      i.waitDays = i.ready && i.first ? dayDiff(i.ready, i.first) : 0;
+      i.stretch = tally(i, i.first, i.last);
+      i.stretchDays = i.first && i.last ? dayDiff(i.first, i.last) : 0;
+    });
+
+    // Critical path: walk back from the task that finishes last through whichever dependency finished last.
+    const critical = new Set();
+    let tail = worked.filter(t => info[t.id].last).sort((x, y) => info[y.id].last.localeCompare(info[x.id].last))[0];
+    const chain = [];
+    while (tail && !critical.has(tail.id)){
+      critical.add(tail.id); chain.unshift(tail);
+      const g = info[tail.id].gatingDep;
+      tail = g ? state.tasks.find(t => t.id === g) : null;
+    }
+
+    const rows = [];
+    rows.push(['Project flow — ' + (b.jobNumber || '(no job #)')]);
+    rows.push(['Dealer', b.dealer || '', 'Customer', b.customer || '', 'Machine type', b.machineType || '']);
+    rows.push(['Build sheet release', fmtD(b.buildSheetReleaseDate), 'Order date', fmtD(b.orderDate), 'Lead time (days)', eff ? eff.leadDays : '']);
+    rows.push(['Earliest start (materials)', fmtD(b.earliestStartDate), 'First work', fmtD(b.startDate), 'Dispatch', fmtD(dispatchDateFor(b))]);
+    rows.push([]);
+    rows.push(['Order', 'Task', 'Pool', 'Depends on', 'Planned hrs', 'Max people', 'Ready', 'First work', 'Last work', 'Days worked',
+      'Days waiting to start', 'of which shutdown', 'of which non-working', 'of which pool busy / other jobs', 'Gap days while in progress',
+      'of which shutdown', 'of which non-working', 'of which pool busy / other jobs', 'On critical path', 'What held it up']);
+    worked.slice().sort((x, y) => ((info[x.id].first || '9') < (info[y.id].first || '9') ? -1 : 1)).forEach((t, idx) => {
+      const i = info[t.id];
+      const depNames = (b.dependsOn[t.id] || []).map(id => (state.tasks.find(x => x.id === id) || {}).name).filter(Boolean).join('; ');
+      const why = [];
+      if (i.waitDays > 0){
+        const parts = Object.entries(i.wait).filter(([, n]) => n > 0).map(([k, n]) => `${n} ${k}`);
+        const gate = i.gatingDep ? ` after ${(state.tasks.find(x => x.id === i.gatingDep) || {}).name}` : ' after order/materials';
+        why.push(`Waited ${i.waitDays}d${gate}${parts.length ? ' (' + parts.join(', ') + ')' : ''}`);
+      }
+      const gaps = Object.entries(i.stretch).filter(([, n]) => n > 0);
+      if (gaps.length) why.push('Stretched over ' + (i.stretchDays + 1) + ' calendar days (' + gaps.map(([k, n]) => `${n} ${k}`).join(', ') + ')');
+      rows.push([idx + 1, t.name, i.pool ? i.pool.name : '', depNames, Math.round(i.hours * 100) / 100,
+        i.ts && i.ts.capPeople != null ? i.ts.capPeople : '', fmtD(i.ready), fmtD(i.first), fmtD(i.last), i.dates.length,
+        i.waitDays, i.wait.shutdown, i.wait['non-working day'], i.wait['pool busy / other jobs first'],
+        i.stretch.shutdown + i.stretch['non-working day'] + i.stretch['pool busy / other jobs first'],
+        i.stretch.shutdown, i.stretch['non-working day'], i.stretch['pool busy / other jobs first'],
+        critical.has(t.id) ? 'Yes' : '', why.join('; ')]);
+    });
+
+    // Roll-up on the critical path only — that's what actually sets the dispatch date.
+    const sum = { shutdown: 0, nonworking: 0, busy: 0 };
+    chain.forEach(t => {
+      const i = info[t.id];
+      sum.shutdown += i.wait.shutdown + i.stretch.shutdown;
+      sum.nonworking += i.wait['non-working day'] + i.stretch['non-working day'];
+      sum.busy += i.wait['pool busy / other jobs first'] + i.stretch['pool busy / other jobs first'];
+    });
+    rows.push([]);
+    rows.push(['Critical path', chain.map(t => t.name).join(' → ')]);
+    rows.push(['Calendar days first work → dispatch', b.startDate && dispatchDateFor(b) ? dayDiff(b.startDate, dispatchDateFor(b)) : '']);
+    rows.push(['Lost on the critical path to', 'shutdown: ' + sum.shutdown + 'd', 'non-working days: ' + sum.nonworking + 'd', 'pool busy / other jobs first: ' + sum.busy + 'd']);
+    const biggest = worked.slice().sort((x, y) => (info[y.id].wait['pool busy / other jobs first'] + info[y.id].stretch['pool busy / other jobs first']) - (info[x.id].wait['pool busy / other jobs first'] + info[x.id].stretch['pool busy / other jobs first']))[0];
+    if (biggest){
+      const n = info[biggest.id].wait['pool busy / other jobs first'] + info[biggest.id].stretch['pool busy / other jobs first'];
+      if (n > 0) rows.push(['Biggest capacity bottleneck', biggest.name + ' — ' + n + ' day(s) with ' + (info[biggest.id].pool ? info[biggest.id].pool.name : 'its pool') + ' hours going to other jobs first']);
+    }
+    downloadCsv(rows, `${(b.jobNumber || 'job').replace(/[^a-z0-9\-_]+/gi, '_')}_project_flow.csv`);
   }
 
   function downloadCsv(rows, filename){
